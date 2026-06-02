@@ -9,6 +9,7 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from .assertions import assert_frames, assert_latents, assert_mask, assert_reference_weights, assert_temporal_memory, assert_warped_references
 from .config import TRDNConfig
 from .convlstm import TemporalMemoryModule
 from .dataset import REVIDESequenceDataset
@@ -17,27 +18,30 @@ from .flow import compute_warped_references_batch, load_raft
 from .losses import LossBundle, weighted_total_loss
 from .reference_selector import ReferenceSelectionModule
 from .diffusion_adapter import TemporalConditioningAdapter, load_diffusion_backbone
+from .temporal_transformer import TemporalRetrievalTransformer
 from .validate import validate_trdn
 
 
 def make_datasets(config: TRDNConfig) -> Tuple[REVIDESequenceDataset, REVIDESequenceDataset]:
     train_dataset = REVIDESequenceDataset(
-        config.dataset_root,
+        config.root_for_split(config.train_split),
         split=config.train_split,
         seq_len=config.seq_len,
         crop_size=config.crop_size,
         random_crop=True,
         extensions=config.image_extensions,
         synthetic_if_empty=True,
+        train_mode=config.train_mode,
     )
     val_dataset = REVIDESequenceDataset(
-        config.dataset_root,
+        config.root_for_split(config.val_split),
         split=config.val_split,
         seq_len=config.seq_len,
         crop_size=config.crop_size,
         random_crop=False,
         extensions=config.image_extensions,
         synthetic_if_empty=True,
+        train_mode=config.train_mode,
     )
     return train_dataset, val_dataset
 
@@ -56,19 +60,35 @@ def make_dataloaders(config: TRDNConfig) -> Tuple[DataLoader, DataLoader]:
     return train_loader, val_loader
 
 
-def build_temporal_modules(config: TRDNConfig, cross_attention_dim: int, device: str) -> Tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
+def build_temporal_modules(
+    config: TRDNConfig, cross_attention_dim: int, device: str
+) -> Tuple[torch.nn.Module, torch.nn.Module | None, torch.nn.Module, torch.nn.Module]:
     temporal_memory = TemporalMemoryModule(hidden_dim=64).to(device)
+    temporal_transformer = (
+        TemporalRetrievalTransformer(
+            memory_dim=64,
+            token_dim=config.transformer_token_dim,
+            num_layers=config.transformer_num_layers,
+            num_heads=config.transformer_num_heads,
+            pool_size=config.transformer_pool_size,
+            max_seq_len=config.seq_len,
+        ).to(device)
+        if config.use_temporal_transformer
+        else None
+    )
     reference_selector = ReferenceSelectionModule(num_references=config.seq_len - 1).to(device)
     conditioning_adapter = TemporalConditioningAdapter(cross_attention_dim=cross_attention_dim, num_tokens=16).to(device)
-    return temporal_memory, reference_selector, conditioning_adapter
+    return temporal_memory, temporal_transformer, reference_selector, conditioning_adapter
 
 
-def build_optimizer(config: TRDNConfig, unet, temporal_memory, reference_selector, conditioning_adapter):
+def build_optimizer(config: TRDNConfig, unet, temporal_memory, temporal_transformer, reference_selector, conditioning_adapter):
     groups = []
     if config.train_unet:
         groups.append({"params": [p for p in unet.parameters() if p.requires_grad], "lr": config.learning_rate})
     if config.train_temporal_modules:
         temporal_params = list(temporal_memory.parameters()) + list(reference_selector.parameters()) + list(conditioning_adapter.parameters())
+        if temporal_transformer is not None:
+            temporal_params += list(temporal_transformer.parameters())
         groups.append({"params": temporal_params, "lr": config.temporal_learning_rate})
     return torch.optim.AdamW(groups, weight_decay=config.weight_decay)
 
@@ -93,17 +113,22 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
     accelerator.init_trackers("TRDN_REVIDE", config=config.to_dict())
 
     diffusion = load_diffusion_backbone(config, device=device)
-    temporal_memory, reference_selector, conditioning_adapter = build_temporal_modules(
+    temporal_memory, temporal_transformer, reference_selector, conditioning_adapter = build_temporal_modules(
         config, diffusion["unet"].config.cross_attention_dim, device
     )
     loss_bundle = LossBundle(device=device)
-    optimizer = build_optimizer(config, diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter)
+    optimizer = build_optimizer(config, diffusion["unet"], temporal_memory, temporal_transformer, reference_selector, conditioning_adapter)
     train_loader, val_loader = make_dataloaders(config)
     raft_model = load_raft(device, config.freeze_raft) if config.use_raft_alignment and torch.cuda.is_available() else None
 
-    diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer, train_loader = accelerator.prepare(
-        diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer, train_loader
-    )
+    if temporal_transformer is not None:
+        diffusion["unet"], temporal_memory, temporal_transformer, reference_selector, conditioning_adapter, optimizer, train_loader = accelerator.prepare(
+            diffusion["unet"], temporal_memory, temporal_transformer, reference_selector, conditioning_adapter, optimizer, train_loader
+        )
+    else:
+        diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer, train_loader = accelerator.prepare(
+            diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer, train_loader
+        )
     diffusion["vae"].to(accelerator.device)
     diffusion["text_encoder"].to(accelerator.device)
     if raft_model is not None:
@@ -130,18 +155,30 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                 mask = batch["mask"].to(accelerator.device, non_blocking=True)
                 corrupted = batch["corrupted_frame"].to(accelerator.device, non_blocking=True)
                 current = batch["current_frame"].to(accelerator.device, non_blocking=True)
+                assert_frames(frames, seq_len=config.seq_len)
+                assert_mask(mask, target)
 
                 with torch.no_grad():
                     warped_refs, _flows = compute_warped_references_batch(frames, raft_model)
+                assert_warped_references(warped_refs, seq_len=config.seq_len)
 
-                memory = temporal_memory(torch.cat([warped_refs, current.unsqueeze(1)], dim=1))
-                ref = reference_selector(warped_refs, memory)
+                aligned_frames = torch.cat([warped_refs, current.unsqueeze(1)], dim=1)
+                memory = temporal_memory(aligned_frames)
+                prior_logits = None
+                if temporal_transformer is not None:
+                    transformer_out = temporal_transformer(aligned_frames, memory)
+                    memory = transformer_out["enhanced_memory"]
+                    prior_logits = transformer_out["reference_prior_logits"]
+                assert_temporal_memory(memory, batch=frames.shape[0])
+                ref = reference_selector(warped_refs, memory, prior_logits=prior_logits)
+                assert_reference_weights(ref["weights"], seq_len=config.seq_len)
                 cond_tokens = conditioning_adapter(memory, ref["reference_feature"])
                 text = get_text_embeddings(diffusion["tokenizer"], diffusion["text_encoder"], frames.shape[0]).to(cond_tokens.dtype)
                 encoder_hidden_states = torch.cat([text, cond_tokens], dim=1)
 
                 with torch.no_grad():
                     latents = encode_images_to_latents(diffusion["vae"], target)
+                assert_latents(latents, target)
                 noise = torch.randn_like(latents)
                 timesteps = torch.randint(
                     0, diffusion["noise_scheduler"].config.num_train_timesteps, (latents.shape[0],), device=latents.device
@@ -163,10 +200,12 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                 }
                 total_loss = weighted_total_loss(config, parts)
                 accelerator.backward(total_loss)
+                grad_norm = None
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
+                    grad_norm = accelerator.clip_grad_norm_(
                         list(diffusion["unet"].parameters())
                         + list(temporal_memory.parameters())
+                        + ([] if temporal_transformer is None else list(temporal_transformer.parameters()))
                         + list(reference_selector.parameters())
                         + list(conditioning_adapter.parameters()),
                         config.max_grad_norm,
@@ -177,6 +216,8 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
             if accelerator.is_main_process and global_step % config.log_every == 0:
                 logs = {f"train/{key}_loss": float(value.detach().cpu()) for key, value in parts.items()}
                 logs["train/total_loss"] = float(total_loss.detach().cpu())
+                if grad_norm is not None:
+                    logs["train/grad_norm"] = float(grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm)
                 accelerator.log(logs, step=global_step)
                 progress.set_postfix({"loss": logs["train/total_loss"]})
 
@@ -185,6 +226,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     val_loader,
                     diffusion,
                     temporal_memory,
+                    temporal_transformer,
                     reference_selector,
                     conditioning_adapter,
                     loss_bundle,
@@ -222,10 +264,20 @@ def dry_run_shape_test(seq_len: int = 10, image_size: int = 64, batch_size: int 
     mask = torch.rand(batch_size, 1, image_size, image_size, device=device)
     warped_refs, flows = compute_warped_references_batch(frames, raft_model=None)
     memory_module = TemporalMemoryModule(hidden_dim=64).to(device)
+    transformer = TemporalRetrievalTransformer(
+        max_seq_len=seq_len,
+        pool_size=4,
+        token_dim=128,
+        num_layers=1,
+        num_heads=4,
+    ).to(device)
     selector = ReferenceSelectionModule(num_references=seq_len - 1).to(device)
     adapter = TemporalConditioningAdapter(cross_attention_dim=768, num_tokens=16).to(device)
-    memory = memory_module(torch.cat([warped_refs, frames[:, -1:].contiguous()], dim=1))
-    ref = selector(warped_refs, memory)
+    aligned = torch.cat([warped_refs, frames[:, -1:].contiguous()], dim=1)
+    memory = memory_module(aligned)
+    transformer_out = transformer(aligned, memory)
+    memory = transformer_out["enhanced_memory"]
+    ref = selector(warped_refs, memory, prior_logits=transformer_out["reference_prior_logits"])
     tokens = adapter(memory, ref["reference_feature"])
     return {
         "frames": tuple(frames.shape),
@@ -235,6 +287,7 @@ def dry_run_shape_test(seq_len: int = 10, image_size: int = 64, batch_size: int 
         "warped_references": tuple(warped_refs.shape),
         "flows": tuple(flows.shape),
         "temporal_memory": tuple(memory.shape),
+        "transformer_tokens": tuple(transformer_out["tokens"].shape),
         "reference_weights": tuple(ref["weights"].shape),
         "conditioning_tokens": tuple(tokens.shape),
     }

@@ -2,10 +2,12 @@ checkpoints/*
 outputs/*
 logs/*
 visualizations/*
+debug_outputs/*
 !checkpoints/.gitkeep
 !outputs/.gitkeep
 !logs/.gitkeep
 !visualizations/.gitkeep
+!debug_outputs/.gitkeep
 *.pth
 *.pt
 *.ckpt

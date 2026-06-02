@@ -18,21 +18,27 @@ from .validate import infer_dehazed_batch
 def load_runtime(config: TRDNConfig, checkpoint_path: str = "") -> Dict[str, Any]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     diffusion = load_diffusion_backbone(config, device=device)
-    temporal_memory, reference_selector, conditioning_adapter = build_temporal_modules(
+    temporal_memory, temporal_transformer, reference_selector, conditioning_adapter = build_temporal_modules(
         config, diffusion["unet"].config.cross_attention_dim, device
     )
     if checkpoint_path:
         accelerator = Accelerator(mixed_precision=config.mixed_precision)
-        optimizer = build_optimizer(config, diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter)
-        diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer = accelerator.prepare(
-            diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer
-        )
+        optimizer = build_optimizer(config, diffusion["unet"], temporal_memory, temporal_transformer, reference_selector, conditioning_adapter)
+        if temporal_transformer is not None:
+            diffusion["unet"], temporal_memory, temporal_transformer, reference_selector, conditioning_adapter, optimizer = accelerator.prepare(
+                diffusion["unet"], temporal_memory, temporal_transformer, reference_selector, conditioning_adapter, optimizer
+            )
+        else:
+            diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer = accelerator.prepare(
+                diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer
+            )
         accelerator.load_state(checkpoint_path)
     raft_model = load_raft(device, config.freeze_raft) if config.use_raft_alignment and torch.cuda.is_available() else None
     return {
         "device": device,
         "diffusion": diffusion,
         "temporal_memory": temporal_memory,
+        "temporal_transformer": temporal_transformer,
         "reference_selector": reference_selector,
         "conditioning_adapter": conditioning_adapter,
         "raft_model": raft_model,
@@ -45,13 +51,14 @@ def run_inference_on_index(config: TRDNConfig, index: int = 0, checkpoint_path: 
     paths = config.ensure_dirs()
     runtime = load_runtime(config, checkpoint_path)
     dataset = REVIDESequenceDataset(
-        config.dataset_root,
+        config.root_for_split(config.val_split),
         split=config.val_split,
         seq_len=config.seq_len,
         crop_size=config.crop_size,
         random_crop=False,
         extensions=config.image_extensions,
         synthetic_if_empty=True,
+        train_mode=config.train_mode,
     )
     sample = dataset[index]
     batch = {
@@ -64,6 +71,7 @@ def run_inference_on_index(config: TRDNConfig, index: int = 0, checkpoint_path: 
         batch["corrupted_frame"],
         runtime["diffusion"],
         runtime["temporal_memory"],
+        runtime["temporal_transformer"],
         runtime["reference_selector"],
         runtime["conditioning_adapter"],
         runtime["device"],

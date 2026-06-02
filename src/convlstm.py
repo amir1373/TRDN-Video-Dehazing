@@ -3,6 +3,8 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
+from .assertions import assert_frames, assert_temporal_memory
+
 
 class ConvLSTMCell(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3):
@@ -41,9 +43,12 @@ class TemporalMemoryModule(nn.Module):
         )
 
     def forward(self, aligned_frames: torch.Tensor) -> torch.Tensor:
+        assert_frames(aligned_frames, name="aligned_frames")
         batch, seq_len, _, height, width = aligned_frames.shape
         h = aligned_frames.new_zeros(batch, self.hidden_dim, height, width)
         c = aligned_frames.new_zeros(batch, self.hidden_dim, height, width)
         for tidx in range(seq_len):
             h, c = self.cell(self.stem(aligned_frames[:, tidx]), (h, c))
-        return self.out(h)
+        memory = self.out(h)
+        assert_temporal_memory(memory, batch=batch)
+        return memory

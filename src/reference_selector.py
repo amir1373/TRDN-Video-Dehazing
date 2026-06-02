@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from .assertions import assert_reference_weights, assert_temporal_memory, assert_warped_references
+
 
 class ReferenceSelectionModule(nn.Module):
     """Learn per-pixel reliability weights over warped reference frames."""
@@ -28,7 +30,9 @@ class ReferenceSelectionModule(nn.Module):
             nn.SiLU(),
         )
 
-    def forward(self, warped_refs: torch.Tensor, temporal_memory: torch.Tensor) -> dict:
+    def forward(self, warped_refs: torch.Tensor, temporal_memory: torch.Tensor, prior_logits: torch.Tensor | None = None) -> dict:
+        assert_warped_references(warped_refs, seq_len=self.num_references + 1)
+        assert_temporal_memory(temporal_memory, batch=warped_refs.shape[0])
         batch, num_refs, channels, height, width = warped_refs.shape
         if num_refs != self.num_references:
             raise ValueError(f"Expected {self.num_references} references, got {num_refs}")
@@ -37,7 +41,12 @@ class ReferenceSelectionModule(nn.Module):
         memory = self.memory_proj(temporal_memory).unsqueeze(1).expand(-1, num_refs, -1, -1, -1)
         logits = self.score(torch.cat([ref_feats, memory], dim=2).reshape(batch * num_refs, -1, height, width))
         logits = logits.reshape(batch, num_refs, height, width)
+        if prior_logits is not None:
+            if tuple(prior_logits.shape) != tuple(logits.shape):
+                raise ValueError(f"prior_logits must match reference logits {tuple(logits.shape)}, got {tuple(prior_logits.shape)}")
+            logits = logits + prior_logits
         weights = torch.softmax(logits, dim=1)
+        assert_reference_weights(weights, seq_len=self.num_references + 1)
         weighted_reference = (weights.unsqueeze(2) * warped_refs).sum(dim=1)
         reference_feature = self.out_proj((weights.unsqueeze(2) * ref_feats).sum(dim=1))
         return {

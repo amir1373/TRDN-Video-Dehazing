@@ -4,6 +4,7 @@ einops>=0.8.0
 lpips>=0.1.4
 matplotlib>=3.7.0
 opencv-python>=4.8.0
+peft>=0.11.0
 scikit-image>=0.22.0
 tensorboard>=2.16.0
 torchmetrics>=1.4.0

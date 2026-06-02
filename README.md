@@ -16,7 +16,7 @@ Single-image dehazing often loses temporal information that is available in vide
 
 ## Architecture Overview
 
-TRDN V1:
+TRDN:
 
 ```text
 Current hazy frame + previous 9 frames
@@ -29,6 +29,9 @@ Warp previous frames into current-frame coordinates
         |
         v
 ConvLSTM TemporalMemoryModule
+        |
+        v
+Temporal Retrieval Transformer
         |
         v
 ReferenceSelectionModule with per-pixel reference weights
@@ -88,10 +91,15 @@ Recognized clean folder names include `gt`, `clean`, `clear`, `target`, and `gro
    /content/drive/MyDrive/REVIDE
    ```
 
-2. In the notebook configuration cell, set:
+2. Paths are centralized in `src/config.py`:
 
-   ```python
-   DATASET_ROOT = "/content/drive/MyDrive/REVIDE"
+   ```text
+   TRAIN_ROOT = /content/drive/MyDrive/REVIDE_sequences/Train
+   TEST_ROOT  = /content/drive/MyDrive/REVIDE_sequences/Test
+   TRAIN_HAZY = /content/drive/MyDrive/REVIDE_sequences/Train/hazy
+   TEST_HAZY  = /content/drive/MyDrive/REVIDE_sequences/Test/hazy
+   FLOW_TRAIN = /content/drive/MyDrive/video_dehaze_flows/train
+   FLOW_VAL   = /content/drive/MyDrive/video_dehaze_flows/val
    ```
 
 3. Project outputs default to:
@@ -140,6 +148,32 @@ The notebook includes dedicated debug cells for:
 - diffusion output
 - dry-run tensor shape checks
 
+Run `notebooks/DATASET_INSPECTOR.ipynb` before training to verify REVIDE sequence discovery, frame counts, and image sizes.
+
+## Training Modes
+
+`src/config.py` exposes:
+
+```python
+train_mode = "reconstruct"  # or "dehaze"
+```
+
+`dehaze`:
+
+```text
+input  = hazy current frame + previous hazy frames
+target = clean current frame
+```
+
+`reconstruct`:
+
+```text
+input  = clean sequence with synthetic haze/occlusion on current frame
+target = clean current frame
+```
+
+Both modes use REVIDE only.
+
 ## How to Train
 
 Notebook:
@@ -153,7 +187,6 @@ Script:
 
 ```bash
 python scripts/train_colab.py \
-  --dataset-root /content/drive/MyDrive/REVIDE \
   --project-root /content/drive/MyDrive/TRDN_REVIDE \
   --max-train-steps 1000
 ```
@@ -162,7 +195,6 @@ Resume:
 
 ```bash
 python scripts/train_colab.py \
-  --dataset-root /content/drive/MyDrive/REVIDE \
   --resume-from-checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/last
 ```
 
@@ -170,7 +202,6 @@ python scripts/train_colab.py \
 
 ```bash
 python scripts/validate_colab.py \
-  --dataset-root /content/drive/MyDrive/REVIDE \
   --checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/best_psnr
 ```
 
@@ -180,12 +211,27 @@ Validation reports PSNR, SSIM, and LPIPS. It does not fake or include training r
 
 ```bash
 python scripts/inference_colab.py \
-  --dataset-root /content/drive/MyDrive/REVIDE \
   --checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/best_psnr \
   --index 0
 ```
 
 Predictions are written to `outputs/` under the configured project root.
+
+## Debug Forward Pass
+
+Fast local/CPU smoke test:
+
+```bash
+python debug_forward_pass.py --skip-diffusion --no-raft
+```
+
+Full Colab GPU debug pass:
+
+```bash
+python debug_forward_pass.py
+```
+
+Outputs are written to `debug_outputs/` and include masks, warped references, flow RGB, temporal memory maps, reference maps, parameter counts, memory usage, and diffusion predictions when diffusion is enabled.
 
 ## Repository Structure
 
@@ -208,6 +254,7 @@ TRDN-Video-Dehazing/
     warp.py
     convlstm.py
     reference_selector.py
+    temporal_transformer.py
     diffusion_adapter.py
     losses.py
     metrics.py
@@ -222,11 +269,12 @@ TRDN-Video-Dehazing/
   checkpoints/
   logs/
   visualizations/
+  debug_outputs/
 ```
 
 ## Troubleshooting
 
-- **No REVIDE clips found:** Check `DATASET_ROOT` and folder names. The notebook falls back to synthetic debug samples so shape tests can still run.
+- **No REVIDE clips found:** Check `TRAIN_ROOT`, `TEST_ROOT`, and folder names in `src/config.py`. The notebook falls back to synthetic debug samples so shape tests can still run.
 - **CUDA out of memory:** Keep `BATCH_SIZE=1`, `IMAGE_SIZE=256`, mixed precision enabled, and UNet gradient checkpointing enabled. Disable RAFT alignment for quick tests.
 - **RAFT download is slow:** The first run downloads torchvision RAFT weights. Subsequent Colab sessions may need to download again unless cached.
 - **Stable Diffusion download/auth issues:** Ensure the Colab runtime has internet access. If Hugging Face authentication is required in your environment, run `huggingface-cli login` without committing tokens.

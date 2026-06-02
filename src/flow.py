@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .warp import warp_with_flow
+from .assertions import assert_flow, assert_frames, assert_image, assert_warped_references
 
 
 def load_raft(device: str = "cuda", freeze: bool = True) -> nn.Module:
@@ -26,13 +27,19 @@ def _raft_preprocess(x: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def compute_raft_flow(raft_model: nn.Module, source: torch.Tensor, target: torch.Tensor, iters: int = 12) -> torch.Tensor:
     """Compute RAFT flow source -> target as [B, 2, H, W]."""
+    assert_image(source, name="source")
+    assert_image(target, name="target")
+    if tuple(source.shape) != tuple(target.shape):
+        raise ValueError(f"RAFT source and target shapes must match, got {tuple(source.shape)} and {tuple(target.shape)}")
     _, _, height, width = source.shape
     pad_h = (8 - height % 8) % 8
     pad_w = (8 - width % 8) % 8
     source_in = F.pad(source.float(), (0, pad_w, 0, pad_h), mode="replicate")
     target_in = F.pad(target.float(), (0, pad_w, 0, pad_h), mode="replicate")
     flow = raft_model(_raft_preprocess(source_in), _raft_preprocess(target_in), num_flow_updates=iters)[-1]
-    return flow[..., :height, :width]
+    flow = flow[..., :height, :width]
+    assert_flow(flow, name="raft_flow")
+    return flow
 
 
 @torch.no_grad()
@@ -48,6 +55,7 @@ def compute_warped_references_batch(
         warped_references: [B, T-1, 3, H, W]
         flows: [B, T-1, 2, H, W]
     """
+    assert_frames(frames, name="frames")
     batch, seq_len, _, height, width = frames.shape
     current = frames[:, -1]
     warped_refs = []
@@ -60,7 +68,11 @@ def compute_warped_references_batch(
             flow = compute_raft_flow(raft_model, source, current)
         warped_refs.append(warp_with_flow(source, flow))
         flows.append(flow)
-    return torch.stack(warped_refs, dim=1), torch.stack(flows, dim=1)
+    warped = torch.stack(warped_refs, dim=1)
+    flow_stack = torch.stack(flows, dim=1)
+    assert_warped_references(warped, seq_len=seq_len)
+    assert_flow(flow_stack, frames=frames, name="flow_stack")
+    return warped, flow_stack
 
 
 def flow_to_rgb(flow: torch.Tensor) -> torch.Tensor:

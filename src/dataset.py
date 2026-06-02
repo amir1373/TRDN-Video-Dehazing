@@ -99,6 +99,7 @@ class REVIDESequenceDataset(Dataset):
         extensions: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"),
         synthetic_if_empty: bool = True,
         max_sequences: Optional[int] = None,
+        train_mode: str = "reconstruct",
     ):
         self.root = Path(root)
         self.split = split
@@ -107,6 +108,9 @@ class REVIDESequenceDataset(Dataset):
         self.random_crop = random_crop
         self.extensions = extensions
         self.synthetic_if_empty = synthetic_if_empty
+        if train_mode not in {"dehaze", "reconstruct"}:
+            raise ValueError(f"train_mode must be 'dehaze' or 'reconstruct', got {train_mode!r}")
+        self.train_mode = train_mode
         self.sequences = discover_revide_sequences(self.root, split, extensions)
         if max_sequences is not None:
             self.sequences = self.sequences[:max_sequences]
@@ -121,16 +125,18 @@ class REVIDESequenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.index) if self.index else self.synthetic_len
 
-    def _load_real_clip(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, List[str], str]:
+    def _load_real_clip(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str], str]:
         seq_idx, end_idx = self.index[idx]
         sequence = self.sequences[seq_idx]
         start_idx = end_idx - self.seq_len + 1
         hazy_paths = sequence["hazy_files"][start_idx : end_idx + 1]
-        frames = torch.stack([image_to_tensor(path) for path in hazy_paths], dim=0)
+        clean_paths = sequence["clean_files"][start_idx : end_idx + 1]
+        hazy_frames = torch.stack([image_to_tensor(path) for path in hazy_paths], dim=0)
+        clean_frames = torch.stack([image_to_tensor(path) for path in clean_paths], dim=0)
         target = image_to_tensor(sequence["clean_files"][end_idx])
-        return frames, target, [str(path) for path in hazy_paths], sequence["name"]
+        return hazy_frames, clean_frames, target, [str(path) for path in hazy_paths], sequence["name"]
 
-    def _load_synthetic_clip(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, List[str], str]:
+    def _load_synthetic_clip(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str], str]:
         height = width = max(self.crop_size, 256)
         yy, xx = torch.meshgrid(torch.linspace(0, 1, height), torch.linspace(0, 1, width), indexing="ij")
         clean_frames = []
@@ -147,27 +153,40 @@ class REVIDESequenceDataset(Dataset):
                 )
             )
         target = clean_frames[-1].clone()
-        frames = torch.stack([torch.clamp(frame * 0.65 + 0.35, 0, 1) for frame in clean_frames], dim=0)
-        return frames, target, [f"synthetic_{idx}_{tidx}.png" for tidx in range(self.seq_len)], "synthetic"
+        clean_stack = torch.stack(clean_frames, dim=0)
+        hazy_stack = torch.stack([torch.clamp(frame * 0.65 + 0.35, 0, 1) for frame in clean_frames], dim=0)
+        return hazy_stack, clean_stack, target, [f"synthetic_{idx}_{tidx}.png" for tidx in range(self.seq_len)], "synthetic"
 
-    def _crop(self, frames: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        _, _, height, width = frames.shape
+    def _crop_triplet(
+        self, hazy_frames: torch.Tensor, clean_frames: torch.Tensor, target: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _, _, height, width = hazy_frames.shape
         crop = min(self.crop_size, height, width)
         if height == crop and width == crop:
-            return frames, target
+            return hazy_frames, clean_frames, target
         top = random.randint(0, height - crop) if self.random_crop else (height - crop) // 2
         left = random.randint(0, width - crop) if self.random_crop else (width - crop) // 2
-        return frames[:, :, top : top + crop, left : left + crop], target[:, top : top + crop, left : left + crop]
+        return (
+            hazy_frames[:, :, top : top + crop, left : left + crop],
+            clean_frames[:, :, top : top + crop, left : left + crop],
+            target[:, top : top + crop, left : left + crop],
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if self.index:
-            frames, target, paths, name = self._load_real_clip(idx)
+            hazy_frames, clean_frames, target, paths, name = self._load_real_clip(idx)
         else:
-            frames, target, paths, name = self._load_synthetic_clip(idx)
-        frames, target = self._crop(frames, target)
+            hazy_frames, clean_frames, target, paths, name = self._load_synthetic_clip(idx)
+        hazy_frames, clean_frames, target = self._crop_triplet(hazy_frames, clean_frames, target)
         _, height, width = target.shape
         mask = generate_haze_mask(height, width, mode="mixed").float()
-        corrupted = simulate_realistic_haze(target.unsqueeze(0), mask.unsqueeze(0))[0]
+        if self.train_mode == "dehaze":
+            frames = hazy_frames
+            corrupted = hazy_frames[-1]
+        else:
+            frames = clean_frames.clone()
+            corrupted = simulate_realistic_haze(target.unsqueeze(0), mask.unsqueeze(0))[0]
+            frames[-1] = corrupted
         return {
             "frames": frames.float(),
             "current_frame": frames[-1].float(),
@@ -175,6 +194,9 @@ class REVIDESequenceDataset(Dataset):
             "mask": mask.float(),
             "corrupted_frame": corrupted.float(),
             "warped_references": frames[:-1].clone().float(),
+            "clean_frames": clean_frames.float(),
+            "hazy_frames": hazy_frames.float(),
+            "train_mode": self.train_mode,
             "sequence_name": name,
             "frame_paths": paths,
         }

@@ -1,13 +1,19 @@
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Tuple
+from typing import Literal, Tuple
 
 
 @dataclass
 class TRDNConfig:
     """Central configuration for TRDN Colab and script runs."""
 
-    dataset_root: str = "/content/drive/MyDrive/REVIDE"
+    train_root: str = "/content/drive/MyDrive/REVIDE_sequences/Train"
+    test_root: str = "/content/drive/MyDrive/REVIDE_sequences/Test"
+    train_hazy: str = "/content/drive/MyDrive/REVIDE_sequences/Train/hazy"
+    test_hazy: str = "/content/drive/MyDrive/REVIDE_sequences/Test/hazy"
+    flow_train: str = "/content/drive/MyDrive/video_dehaze_flows/train"
+    flow_val: str = "/content/drive/MyDrive/video_dehaze_flows/val"
+    dataset_root: str = "/content/drive/MyDrive/REVIDE_sequences"
     project_root: str = "/content/drive/MyDrive/TRDN_REVIDE"
 
     image_size: int = 256
@@ -17,6 +23,7 @@ class TRDNConfig:
     num_workers: int = 2
     mixed_precision: str = "fp16"
     seed: int = 1234
+    train_mode: Literal["dehaze", "reconstruct"] = "reconstruct"
 
     train_split: str = "train"
     val_split: str = "val"
@@ -25,10 +32,20 @@ class TRDNConfig:
     sd_model_id: str = "runwayml/stable-diffusion-inpainting"
     use_raft_alignment: bool = True
     freeze_raft: bool = True
+    use_temporal_transformer: bool = True
+    transformer_num_layers: int = 4
+    transformer_num_heads: int = 8
+    transformer_token_dim: int = 256
+    transformer_pool_size: int = 8
     train_unet: bool = True
     train_temporal_modules: bool = True
+    enable_lora: bool = False
+    lora_rank: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.0
     enable_unet_gradient_checkpointing: bool = True
     enable_xformers_if_available: bool = True
+    enable_torch_compile: bool = False
 
     learning_rate: float = 1e-5
     temporal_learning_rate: float = 1e-4
@@ -59,6 +76,7 @@ class TRDNConfig:
             "logs": root / "logs",
             "outputs": root / "outputs",
             "visualizations": root / "visualizations",
+            "debug_outputs": root / "debug_outputs",
         }
 
     def ensure_dirs(self) -> dict:
@@ -69,3 +87,15 @@ class TRDNConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def root_for_split(self, split: str) -> str:
+        normalized = split.lower()
+        if normalized in {"train", "training"}:
+            return self.train_root
+        if normalized in {"val", "valid", "validation", "test", "testing"}:
+            return self.test_root
+        return self.dataset_root
+
+    def flow_root_for_split(self, split: str) -> str:
+        normalized = split.lower()
+        return self.flow_train if normalized in {"train", "training"} else self.flow_val

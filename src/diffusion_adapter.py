@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .assertions import assert_image, assert_latents, assert_mask, assert_temporal_memory
+
 
 def normalize_to_neg_one_to_one(x: torch.Tensor) -> torch.Tensor:
     return x * 2.0 - 1.0
@@ -42,6 +44,8 @@ class TemporalConditioningAdapter(nn.Module):
         self.token_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, temporal_memory: torch.Tensor, reference_feature: torch.Tensor) -> torch.Tensor:
+        assert_temporal_memory(temporal_memory, name="temporal_memory")
+        assert_temporal_memory(reference_feature, batch=temporal_memory.shape[0], name="reference_feature")
         x = self.encoder(torch.cat([temporal_memory, reference_feature], dim=1))
         tokens = self.pool(x).flatten(2).transpose(1, 2)
         return self.proj(tokens) * self.token_scale
@@ -60,12 +64,25 @@ def load_diffusion_backbone(config: Any, device: str = "cuda") -> Dict[str, Any]
     inference_scheduler = DDIMScheduler.from_pretrained(config.sd_model_id, subfolder="scheduler")
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    unet.requires_grad_(config.train_unet)
+    unet.requires_grad_(config.train_unet and not config.enable_lora)
+    lora_report = None
+    if config.enable_lora:
+        lora_report = enable_lora_for_unet(
+            unet,
+            rank=config.lora_rank,
+            alpha=config.lora_alpha,
+            dropout=config.lora_dropout,
+        )
     if config.enable_unet_gradient_checkpointing:
         unet.enable_gradient_checkpointing()
     if config.enable_xformers_if_available:
         try:
             unet.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
+    if config.enable_torch_compile and hasattr(torch, "compile"):
+        try:
+            unet = torch.compile(unet)
         except Exception:
             pass
     return {
@@ -75,6 +92,7 @@ def load_diffusion_backbone(config: Any, device: str = "cuda") -> Dict[str, Any]
         "unet": unet,
         "noise_scheduler": noise_scheduler,
         "inference_scheduler": inference_scheduler,
+        "lora_report": lora_report,
     }
 
 
@@ -91,12 +109,16 @@ def get_text_embeddings(tokenizer: Any, text_encoder: Any, batch_size: int, prom
 
 
 def encode_images_to_latents(vae: Any, images: torch.Tensor) -> torch.Tensor:
+    assert_image(images, name="images")
     dtype = next(vae.parameters()).dtype
     images = normalize_to_neg_one_to_one(images).to(device=vae.device, dtype=dtype)
-    return vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
+    latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
+    assert_latents(latents, images)
+    return latents
 
 
 def decode_latents_to_images(vae: Any, latents: torch.Tensor) -> torch.Tensor:
+    assert_latents(latents)
     dtype = next(vae.parameters()).dtype
     latents = latents.to(device=vae.device, dtype=dtype) / vae.config.scaling_factor
     images = vae.decode(latents).sample.float()
@@ -104,6 +126,9 @@ def decode_latents_to_images(vae: Any, latents: torch.Tensor) -> torch.Tensor:
 
 
 def prepare_inpainting_inputs(vae: Any, noisy_latents: torch.Tensor, mask: torch.Tensor, masked_image: torch.Tensor) -> torch.Tensor:
+    assert_latents(noisy_latents, masked_image, name="noisy_latents")
+    assert_mask(mask, masked_image)
+    assert_image(masked_image, name="masked_image")
     latent_h, latent_w = noisy_latents.shape[-2:]
     mask_latent = F.interpolate(mask.float(), size=(latent_h, latent_w), mode="nearest").to(
         noisy_latents.device, noisy_latents.dtype
@@ -119,7 +144,32 @@ def estimate_x0_from_epsilon(noise_scheduler: Any, noisy_latents: torch.Tensor, 
     return (noisy_latents - sqrt_one_minus * noise_pred) / (sqrt_alpha + 1e-8)
 
 
-def enable_lora_for_unet(unet: Any, rank: int = 8) -> Any:
-    """LoRA hook for future experiments. Baseline V1 trains the UNet directly."""
-    print(f"LoRA hook available. Configure PEFT/Diffusers LoRA adapters here with rank={rank}.")
-    return unet
+def enable_lora_for_unet(unet: Any, rank: int = 8, alpha: int = 16, dropout: float = 0.0) -> dict:
+    """Attach PEFT LoRA adapters to Stable Diffusion UNet attention projections."""
+    from peft import LoraConfig
+
+    for param in unet.parameters():
+        param.requires_grad_(False)
+    target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
+    lora_config = LoraConfig(
+        r=rank,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        init_lora_weights="gaussian",
+        target_modules=target_modules,
+    )
+    unet.add_adapter(lora_config)
+    total = sum(param.numel() for param in unet.parameters())
+    trainable = sum(param.numel() for param in unet.parameters() if param.requires_grad)
+    report = {
+        "enabled": True,
+        "rank": rank,
+        "alpha": alpha,
+        "dropout": dropout,
+        "target_modules": target_modules,
+        "total_parameters": total,
+        "trainable_parameters": trainable,
+        "trainable_percent": 100.0 * trainable / max(total, 1),
+    }
+    print("LoRA enabled:", report)
+    return report
