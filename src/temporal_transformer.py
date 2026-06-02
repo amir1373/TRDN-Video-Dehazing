@@ -85,9 +85,11 @@ class TemporalRetrievalTransformer(nn.Module):
         prior = self.reference_prior(encoded[:, :-1]).squeeze(-1)
         prior = prior.reshape(batch, seq_len - 1, self.pool_size, self.pool_size)
         prior = F.interpolate(prior, size=(height, width), mode="bilinear", align_corners=False)
+        token_importance = encoded.norm(dim=-1).reshape(batch, seq_len, self.pool_size, self.pool_size)
         assert_reference_weights(torch.softmax(prior, dim=1), seq_len=seq_len, name="transformer_reference_prior")
         return {
             "enhanced_memory": enhanced_memory,
             "reference_prior_logits": prior,
             "tokens": encoded.reshape(batch, seq_len * self.pool_size * self.pool_size, -1),
+            "token_importance": token_importance,
         }

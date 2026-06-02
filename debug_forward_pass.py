@@ -114,6 +114,9 @@ def main():
     save_image(mem_vis, debug_dir / "temporal_memory_ch0.png")
     save_image(ref["weights"][:, 0:1], debug_dir / "reference_weight_0.png")
     save_image(ref["weighted_reference"], debug_dir / "weighted_reference.png")
+    attention = transformer_out["token_importance"][:, -1:]
+    attention = (attention - attention.amin(dim=(2, 3), keepdim=True)) / (attention.amax(dim=(2, 3), keepdim=True) - attention.amin(dim=(2, 3), keepdim=True) + 1e-8)
+    save_image(attention, debug_dir / "attention_current_frame.png")
 
     report = {
         "train_mode": config.train_mode,
@@ -127,6 +130,7 @@ def main():
             "flows": tuple(flows.shape),
             "temporal_memory": tuple(memory.shape),
             "transformer_tokens": tuple(transformer_out["tokens"].shape),
+            "transformer_token_importance": tuple(transformer_out["token_importance"].shape),
             "reference_weights": tuple(ref["weights"].shape),
             "conditioning_tokens": tuple(tokens.shape),
         },

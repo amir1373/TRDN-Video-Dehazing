@@ -10,6 +10,21 @@ TRDN reconstructs a clean current frame from a hazy 10-frame sequence:
 
 The primary workflow is a VS Code notebook connected to a Google Colab GPU runtime. The reusable implementation lives in `src/`, and the notebook is kept in `notebooks/TRDN_REVIDE_Colab.ipynb`.
 
+## Notebook / Repository Synchronization
+
+The notebook is the execution interface, not a second implementation. All major research logic lives in `src/` and is imported by the notebook:
+
+- datasets and REVIDE parsing: `src/dataset.py`
+- masks and haze simulation: `src/masks.py`, `src/haze.py`
+- RAFT and warping: `src/flow.py`, `src/warp.py`
+- temporal modules: `src/convlstm.py`, `src/temporal_transformer.py`
+- reference selection: `src/reference_selector.py`
+- diffusion and conditioning: `src/diffusion_adapter.py`
+- losses and metrics: `src/losses.py`, `src/metrics.py`
+- training, validation, inference: `src/train.py`, `src/validate.py`, `src/inference.py`
+
+Future code changes should be made in `src/` first. The notebook should remain limited to setup, configuration, visualization, debugging, and launch cells.
+
 ## Research Motivation
 
 Single-image dehazing often loses temporal information that is available in video. TRDN V1 uses previous hazy frames as temporal references, aligns them to the current frame with optical flow, learns which aligned references are reliable per pixel, and injects temporal/reference conditioning into a Stable Diffusion inpainting UNet.
@@ -134,7 +149,30 @@ MIXED_PRECISION = "fp16"
 
 ## How to Run the Notebook
 
-Open `notebooks/TRDN_REVIDE_Colab.ipynb` in VS Code, connect it to a Google Colab runtime, and run cells in order.
+Open `notebooks/TRDN_REVIDE_Colab.ipynb` in VS Code, connect it to a Google Colab runtime, and use `Runtime -> Restart and Run All`.
+
+The notebook is organized as 18 run-all-safe cells:
+
+```text
+1. Project Overview
+2. Install Dependencies
+3. Mount Google Drive
+4. Clone/Open Repository
+5. Set Paths
+6. Imports from src/
+7. Dataset Inspection
+8. Dataset Visualization
+9. Flow Visualization
+10. Mask Visualization
+11. Debug Forward Pass
+12. Training Configuration
+13. Training Launch
+14. Validation
+15. Inference
+16. Attention Visualization
+17. Reference Weight Visualization
+18. Checkpoint Management
+```
 
 The notebook includes dedicated debug cells for:
 
