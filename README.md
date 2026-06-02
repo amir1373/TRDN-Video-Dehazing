@@ -1,0 +1,247 @@
+# Temporal Reference-Guided Diffusion Network (TRDN) for Video Dehazing
+
+Research code for **Temporal Reference-Guided Diffusion Network for Video Dehazing using REVIDE**.
+
+TRDN reconstructs a clean current frame from a hazy 10-frame sequence:
+
+```text
+[frame(t-9), ..., frame(t-1), frame(t)] -> clean frame(t)
+```
+
+The primary workflow is a VS Code notebook connected to a Google Colab GPU runtime. The reusable implementation lives in `src/`, and the notebook is kept in `notebooks/TRDN_REVIDE_Colab.ipynb`.
+
+## Research Motivation
+
+Single-image dehazing often loses temporal information that is available in video. TRDN V1 uses previous hazy frames as temporal references, aligns them to the current frame with optical flow, learns which aligned references are reliable per pixel, and injects temporal/reference conditioning into a Stable Diffusion inpainting UNet.
+
+## Architecture Overview
+
+TRDN V1:
+
+```text
+Current hazy frame + previous 9 frames
+        |
+        v
+Pretrained RAFT optical flow, frozen initially
+        |
+        v
+Warp previous frames into current-frame coordinates
+        |
+        v
+ConvLSTM TemporalMemoryModule
+        |
+        v
+ReferenceSelectionModule with per-pixel reference weights
+        |
+        v
+TemporalConditioningAdapter -> Stable Diffusion inpainting cross-attention tokens
+        |
+        v
+Clean current-frame reconstruction
+```
+
+The repository also includes a clean placeholder for a future **Temporal Retrieval Transformer** version.
+
+## Dataset Setup
+
+The code expects REVIDE on Google Drive and lets you set `DATASET_ROOT` manually.
+
+Supported layouts include:
+
+```text
+REVIDE/
+  train/
+    sequence_001/
+      hazy/
+        000001.png
+      gt/
+        000001.png
+  val/
+    sequence_001/
+      hazy/
+      gt/
+```
+
+and:
+
+```text
+REVIDE/
+  train/
+    hazy/
+      sequence_001/
+    gt/
+      sequence_001/
+  val/
+    hazy/
+      sequence_001/
+    gt/
+      sequence_001/
+```
+
+Recognized clean folder names include `gt`, `clean`, `clear`, `target`, and `groundtruth`. Recognized hazy folder names include `hazy`, `input`, `fog`, and `degraded`.
+
+## Google Drive Setup
+
+1. Upload or keep REVIDE in Google Drive, for example:
+
+   ```text
+   /content/drive/MyDrive/REVIDE
+   ```
+
+2. In the notebook configuration cell, set:
+
+   ```python
+   DATASET_ROOT = "/content/drive/MyDrive/REVIDE"
+   ```
+
+3. Project outputs default to:
+
+   ```text
+   /content/drive/MyDrive/TRDN_REVIDE
+   ```
+
+## Colab Runtime Setup
+
+Use a GPU runtime:
+
+```text
+Runtime -> Change runtime type -> GPU
+```
+
+Then run the notebook installation cell or install manually:
+
+```bash
+pip install -r requirements_colab.txt
+```
+
+Initial defaults:
+
+```text
+IMAGE_SIZE = 256
+SEQ_LEN = 10
+BATCH_SIZE = 1
+NUM_WORKERS = 2
+MIXED_PRECISION = "fp16"
+```
+
+## How to Run the Notebook
+
+Open `notebooks/TRDN_REVIDE_Colab.ipynb` in VS Code, connect it to a Google Colab runtime, and run cells in order.
+
+The notebook includes dedicated debug cells for:
+
+- dataset inspection
+- mask generation
+- haze simulation
+- RAFT flow
+- warped references
+- ConvLSTM memory
+- reference weights
+- diffusion output
+- dry-run tensor shape checks
+
+## How to Train
+
+Notebook:
+
+1. Set `DATASET_ROOT`.
+2. Run setup/debug cells.
+3. Set `cfg.run_training_now = True`.
+4. Run the training cell.
+
+Script:
+
+```bash
+python scripts/train_colab.py \
+  --dataset-root /content/drive/MyDrive/REVIDE \
+  --project-root /content/drive/MyDrive/TRDN_REVIDE \
+  --max-train-steps 1000
+```
+
+Resume:
+
+```bash
+python scripts/train_colab.py \
+  --dataset-root /content/drive/MyDrive/REVIDE \
+  --resume-from-checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/last
+```
+
+## How to Validate
+
+```bash
+python scripts/validate_colab.py \
+  --dataset-root /content/drive/MyDrive/REVIDE \
+  --checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/best_psnr
+```
+
+Validation reports PSNR, SSIM, and LPIPS. It does not fake or include training results.
+
+## How to Run Inference
+
+```bash
+python scripts/inference_colab.py \
+  --dataset-root /content/drive/MyDrive/REVIDE \
+  --checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/best_psnr \
+  --index 0
+```
+
+Predictions are written to `outputs/` under the configured project root.
+
+## Repository Structure
+
+```text
+TRDN-Video-Dehazing/
+  README.md
+  LICENSE
+  .gitignore
+  requirements.txt
+  requirements_colab.txt
+  notebooks/
+    TRDN_REVIDE_Colab.ipynb
+  src/
+    __init__.py
+    config.py
+    dataset.py
+    masks.py
+    haze.py
+    flow.py
+    warp.py
+    convlstm.py
+    reference_selector.py
+    diffusion_adapter.py
+    losses.py
+    metrics.py
+    train.py
+    validate.py
+    inference.py
+  scripts/
+    train_colab.py
+    validate_colab.py
+    inference_colab.py
+  outputs/
+  checkpoints/
+  logs/
+  visualizations/
+```
+
+## Troubleshooting
+
+- **No REVIDE clips found:** Check `DATASET_ROOT` and folder names. The notebook falls back to synthetic debug samples so shape tests can still run.
+- **CUDA out of memory:** Keep `BATCH_SIZE=1`, `IMAGE_SIZE=256`, mixed precision enabled, and UNet gradient checkpointing enabled. Disable RAFT alignment for quick tests.
+- **RAFT download is slow:** The first run downloads torchvision RAFT weights. Subsequent Colab sessions may need to download again unless cached.
+- **Stable Diffusion download/auth issues:** Ensure the Colab runtime has internet access. If Hugging Face authentication is required in your environment, run `huggingface-cli login` without committing tokens.
+- **VS Code cannot find `src`:** Run the notebook from the repository root or add the repo root to `sys.path`, as done in the notebook setup cell.
+- **Checkpoint loading mismatch:** Use checkpoints saved by this repository version, especially when loading with Accelerate.
+
+## Citation Placeholder
+
+If you use this research code, cite the project and REVIDE dataset. A formal BibTeX entry can be added after publication:
+
+```bibtex
+@misc{trdn_video_dehazing,
+  title={Temporal Reference-Guided Diffusion Network for Video Dehazing},
+  author={Your Name},
+  year={2026},
+  note={Research code}
+}
+```

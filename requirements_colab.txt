@@ -1,0 +1,12 @@
+accelerate>=0.31.0
+diffusers>=0.30.0
+einops>=0.8.0
+lpips>=0.1.4
+matplotlib>=3.7.0
+opencv-python>=4.8.0
+scikit-image>=0.22.0
+tensorboard>=2.16.0
+torchmetrics>=1.4.0
+tqdm>=4.66.0
+transformers>=4.41.0
+xformers; platform_system != "Windows"

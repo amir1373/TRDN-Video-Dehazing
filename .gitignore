@@ -1,0 +1,17 @@
+checkpoints/*
+outputs/*
+logs/*
+visualizations/*
+!checkpoints/.gitkeep
+!outputs/.gitkeep
+!logs/.gitkeep
+!visualizations/.gitkeep
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+__pycache__/
+**/__pycache__/
+.ipynb_checkpoints/
+.env
+.DS_Store
