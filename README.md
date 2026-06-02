@@ -22,6 +22,7 @@ The notebook is the execution interface, not a second implementation. All major 
 - diffusion and conditioning: `src/diffusion_adapter.py`
 - losses and metrics: `src/losses.py`, `src/metrics.py`
 - training, validation, inference: `src/train.py`, `src/validate.py`, `src/inference.py`
+- notebook execution helpers: `src/notebook_utils.py`
 
 Future code changes should be made in `src/` first. The notebook should remain limited to setup, configuration, visualization, debugging, and launch cells.
 
