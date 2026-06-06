@@ -8,13 +8,15 @@ def main():
     parser = argparse.ArgumentParser(description="Train TRDN on REVIDE from a Colab runtime.")
     parser.add_argument("--dataset-root", default="", help="Optional override for config.train_root/test_root parent.")
     parser.add_argument("--project-root", default="/content/drive/MyDrive/TRDN_REVIDE")
-    parser.add_argument("--max-train-steps", type=int, default=1000)
+    parser.add_argument("--max-train-steps", type=int, default=0, help="0 means train for --num-epochs without a step cap.")
+    parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--resume-from-checkpoint", default="")
     args = parser.parse_args()
 
     config = TRDNConfig(
         project_root=args.project_root,
         max_train_steps=args.max_train_steps,
+        num_epochs=args.num_epochs,
         resume_from_checkpoint=args.resume_from_checkpoint,
     )
     if args.dataset_root:

@@ -144,10 +144,15 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
             best_psnr = float(metadata.get("best_psnr", -1.0))
             best_ssim = float(metadata.get("best_ssim", -1.0))
 
-    progress = tqdm(total=config.max_train_steps, initial=global_step, disable=not accelerator.is_main_process, desc="Training TRDN")
+    target_train_steps = (
+        config.max_train_steps
+        if config.max_train_steps and config.max_train_steps > 0
+        else config.num_epochs * len(train_loader)
+    )
+    progress = tqdm(total=target_train_steps, initial=global_step, disable=not accelerator.is_main_process, desc="Training TRDN")
     for _epoch in range(config.num_epochs):
         for batch in train_loader:
-            if global_step >= config.max_train_steps:
+            if global_step >= target_train_steps:
                 break
             with accelerator.accumulate(diffusion["unet"]):
                 frames = batch["frames"].to(accelerator.device, non_blocking=True)
@@ -249,7 +254,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
 
             global_step += 1
             progress.update(1)
-        if global_step >= config.max_train_steps:
+        if global_step >= target_train_steps:
             break
 
     save_checkpoint(accelerator, paths["checkpoints"], global_step, best_psnr, best_ssim, "last")
