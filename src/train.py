@@ -110,7 +110,12 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
         log_with="tensorboard",
         project_dir=str(paths["logs"]),
     )
-    accelerator.init_trackers("TRDN_REVIDE", config=config.to_tracker_dict())
+    # Some Colab/TensorBoard builds reject otherwise valid hparam values.
+    # Keep tracker startup robust and persist the full config as JSON instead.
+    accelerator.init_trackers("TRDN_REVIDE")
+    if accelerator.is_main_process:
+        with open(paths["logs"] / "config.json", "w", encoding="utf-8") as handle:
+            json.dump(config.to_dict(), handle, indent=2, default=str)
 
     diffusion = load_diffusion_backbone(config, device=device)
     temporal_memory, temporal_transformer, reference_selector, conditioning_adapter = build_temporal_modules(
