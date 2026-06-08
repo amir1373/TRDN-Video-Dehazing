@@ -55,11 +55,15 @@ def load_diffusion_backbone(config: Any, device: str = "cuda") -> Dict[str, Any]
     from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler, UNet2DConditionModel
     from transformers import CLIPTextModel, CLIPTokenizer
 
-    dtype = torch.float16 if config.mixed_precision == "fp16" and torch.cuda.is_available() else torch.float32
+    frozen_dtype = torch.float16 if config.mixed_precision == "fp16" and torch.cuda.is_available() else torch.float32
+    # Trainable parameters must remain FP32 when using AMP/GradScaler.
+    # Loading the trainable UNet directly as FP16 causes:
+    # "ValueError: Attempting to unscale FP16 gradients."
+    unet_dtype = torch.float32 if (config.train_unet or config.enable_lora) else frozen_dtype
     tokenizer = CLIPTokenizer.from_pretrained(config.sd_model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(config.sd_model_id, subfolder="text_encoder", torch_dtype=dtype).to(device)
-    vae = AutoencoderKL.from_pretrained(config.sd_model_id, subfolder="vae", torch_dtype=dtype).to(device)
-    unet = UNet2DConditionModel.from_pretrained(config.sd_model_id, subfolder="unet", torch_dtype=dtype).to(device)
+    text_encoder = CLIPTextModel.from_pretrained(config.sd_model_id, subfolder="text_encoder", torch_dtype=frozen_dtype).to(device)
+    vae = AutoencoderKL.from_pretrained(config.sd_model_id, subfolder="vae", torch_dtype=frozen_dtype).to(device)
+    unet = UNet2DConditionModel.from_pretrained(config.sd_model_id, subfolder="unet", torch_dtype=unet_dtype).to(device)
     noise_scheduler = DDPMScheduler.from_pretrained(config.sd_model_id, subfolder="scheduler")
     inference_scheduler = DDIMScheduler.from_pretrained(config.sd_model_id, subfolder="scheduler")
     vae.requires_grad_(False)
@@ -73,6 +77,9 @@ def load_diffusion_backbone(config: Any, device: str = "cuda") -> Dict[str, Any]
             alpha=config.lora_alpha,
             dropout=config.lora_dropout,
         )
+    for param in unet.parameters():
+        if param.requires_grad:
+            param.data = param.data.float()
     if config.enable_unet_gradient_checkpointing:
         unet.enable_gradient_checkpointing()
     if config.enable_xformers_if_available:

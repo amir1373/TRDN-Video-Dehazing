@@ -173,42 +173,43 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                 assert_warped_references(warped_refs, seq_len=config.seq_len)
 
                 aligned_frames = torch.cat([warped_refs, current.unsqueeze(1)], dim=1)
-                memory = temporal_memory(aligned_frames)
-                prior_logits = None
-                if temporal_transformer is not None:
-                    transformer_out = temporal_transformer(aligned_frames, memory)
-                    memory = transformer_out["enhanced_memory"]
-                    prior_logits = transformer_out["reference_prior_logits"]
-                assert_temporal_memory(memory, batch=frames.shape[0])
-                ref = reference_selector(warped_refs, memory, prior_logits=prior_logits)
-                assert_reference_weights(ref["weights"], seq_len=config.seq_len)
-                cond_tokens = conditioning_adapter(memory, ref["reference_feature"])
-                text = get_text_embeddings(diffusion["tokenizer"], diffusion["text_encoder"], frames.shape[0]).to(cond_tokens.dtype)
-                encoder_hidden_states = torch.cat([text, cond_tokens], dim=1)
+                with accelerator.autocast():
+                    memory = temporal_memory(aligned_frames)
+                    prior_logits = None
+                    if temporal_transformer is not None:
+                        transformer_out = temporal_transformer(aligned_frames, memory)
+                        memory = transformer_out["enhanced_memory"]
+                        prior_logits = transformer_out["reference_prior_logits"]
+                    assert_temporal_memory(memory, batch=frames.shape[0])
+                    ref = reference_selector(warped_refs, memory, prior_logits=prior_logits)
+                    assert_reference_weights(ref["weights"], seq_len=config.seq_len)
+                    cond_tokens = conditioning_adapter(memory, ref["reference_feature"])
+                    text = get_text_embeddings(diffusion["tokenizer"], diffusion["text_encoder"], frames.shape[0]).to(cond_tokens.dtype)
+                    encoder_hidden_states = torch.cat([text, cond_tokens], dim=1)
 
-                with torch.no_grad():
-                    latents = encode_images_to_latents(diffusion["vae"], target)
-                assert_latents(latents, target)
-                noise = torch.randn_like(latents)
-                timesteps = torch.randint(
-                    0, diffusion["noise_scheduler"].config.num_train_timesteps, (latents.shape[0],), device=latents.device
-                ).long()
-                noisy_latents = diffusion["noise_scheduler"].add_noise(latents, noise, timesteps)
-                model_input = prepare_inpainting_inputs(diffusion["vae"], noisy_latents, mask, corrupted)
-                noise_pred = diffusion["unet"](model_input, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+                    with torch.no_grad():
+                        latents = encode_images_to_latents(diffusion["vae"], target)
+                    assert_latents(latents, target)
+                    noise = torch.randn_like(latents)
+                    timesteps = torch.randint(
+                        0, diffusion["noise_scheduler"].config.num_train_timesteps, (latents.shape[0],), device=latents.device
+                    ).long()
+                    noisy_latents = diffusion["noise_scheduler"].add_noise(latents, noise, timesteps)
+                    model_input = prepare_inpainting_inputs(diffusion["vae"], noisy_latents, mask, corrupted)
+                    noise_pred = diffusion["unet"](model_input, timesteps, encoder_hidden_states=encoder_hidden_states).sample
 
-                diffusion_loss = F.mse_loss(noise_pred.float(), noise.float())
-                pred_x0 = estimate_x0_from_epsilon(diffusion["noise_scheduler"], noisy_latents, timesteps, noise_pred)
-                pred_img = decode_latents_to_images(diffusion["vae"], pred_x0)
-                parts = {
-                    "diffusion": diffusion_loss,
-                    "l1": F.l1_loss(pred_img, target),
-                    "lpips": loss_bundle.lpips_loss(pred_img, target),
-                    "temporal": loss_bundle.temporal_consistency_loss(pred_img, warped_refs, ref["weights"]),
-                    "flow": loss_bundle.flow_consistency_loss(warped_refs, current, ref["weights"]),
-                    "reference": loss_bundle.reference_preservation_loss(pred_img, ref["weighted_reference"], mask),
-                }
-                total_loss = weighted_total_loss(config, parts)
+                    diffusion_loss = F.mse_loss(noise_pred.float(), noise.float())
+                    pred_x0 = estimate_x0_from_epsilon(diffusion["noise_scheduler"], noisy_latents, timesteps, noise_pred)
+                    pred_img = decode_latents_to_images(diffusion["vae"], pred_x0)
+                    parts = {
+                        "diffusion": diffusion_loss,
+                        "l1": F.l1_loss(pred_img, target),
+                        "lpips": loss_bundle.lpips_loss(pred_img, target),
+                        "temporal": loss_bundle.temporal_consistency_loss(pred_img, warped_refs, ref["weights"]),
+                        "flow": loss_bundle.flow_consistency_loss(warped_refs, current, ref["weights"]),
+                        "reference": loss_bundle.reference_preservation_loss(pred_img, ref["weighted_reference"], mask),
+                    }
+                    total_loss = weighted_total_loss(config, parts)
                 accelerator.backward(total_loss)
                 grad_norm = None
                 if accelerator.sync_gradients:
