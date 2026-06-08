@@ -110,7 +110,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
         log_with="tensorboard",
         project_dir=str(paths["logs"]),
     )
-    accelerator.init_trackers("TRDN_REVIDE", config=config.to_dict())
+    accelerator.init_trackers("TRDN_REVIDE", config=config.to_tracker_dict())
 
     diffusion = load_diffusion_backbone(config, device=device)
     temporal_memory, temporal_transformer, reference_selector, conditioning_adapter = build_temporal_modules(

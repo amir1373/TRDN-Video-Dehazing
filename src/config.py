@@ -88,6 +88,20 @@ class TRDNConfig:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def to_tracker_dict(self) -> dict:
+        """Return TensorBoard/Accelerate-safe hparams.
+
+        TensorBoard hparams only accepts scalar primitives, so tuple/list/path-like
+        values are stringified for tracker initialization.
+        """
+        safe = {}
+        for key, value in self.to_dict().items():
+            if isinstance(value, (int, float, str, bool)) or value is None:
+                safe[key] = value
+            else:
+                safe[key] = str(value)
+        return safe
+
     def root_for_split(self, split: str) -> str:
         normalized = split.lower()
         if normalized in {"train", "training"}:
