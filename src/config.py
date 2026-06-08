@@ -51,11 +51,11 @@ class TRDNConfig:
     temporal_learning_rate: float = 1e-4
     weight_decay: float = 1e-2
     max_train_steps: int = 0  # 0 means train for num_epochs * len(train_loader).
-    num_epochs: int = 30
+    num_epochs: int = 20
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
     log_every: int = 10
-    validate_every: int = 100
+    validate_every: int = 500
     checkpoint_every: int = 250
     num_inference_steps: int = 30
 
