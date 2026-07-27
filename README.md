@@ -194,22 +194,35 @@ Run `notebooks/DATASET_INSPECTOR.ipynb` before training to verify REVIDE sequenc
 `src/config.py` exposes:
 
 ```python
-train_mode = "reconstruct"  # or "dehaze"
+train_mode = "dehaze"  # or "reconstruct_synthetic" (legacy alias: "reconstruct")
 ```
 
-`dehaze`:
+`dehaze` (default):
 
 ```text
-input  = hazy current frame + previous hazy frames
-target = clean current frame
+input      = real hazy current frame + previous real hazy frames
+references = real hazy frames
+target     = real clean current frame
+mask_mode  = "full" (all-ones; full-frame restoration through the SD inpainting interface)
 ```
 
-`reconstruct`:
+This is the actual video dehazing task and the only mode whose numbers should
+be reported as a dehazing result.
+
+`reconstruct_synthetic` (legacy name: `reconstruct`):
 
 ```text
-input  = clean sequence with synthetic haze/occlusion on current frame
-target = clean current frame
+input      = clean target frame with SYNTHETIC haze painted inside a random mask
+references = GROUND-TRUTH CLEAN frames
+target     = clean current frame
+mask_mode  = "mixed" (random rectangle/ellipse/blob/perlin occlusion, unrelated to real haze)
 ```
+
+Real REVIDE haze never reaches the model in this mode, and the temporal
+references are ground truth. **This is not a dehazing evaluation.** It is
+kept only to explain/reproduce previously-reported numbers, is not the
+default, and logs a loud warning whenever it is selected. See "Evaluation
+protocol" below.
 
 Both modes use REVIDE only.
 
@@ -244,7 +257,73 @@ python scripts/validate_colab.py \
   --checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/best_psnr
 ```
 
-Validation reports PSNR, SSIM, and LPIPS. It does not fake or include training results.
+Validation reports PSNR, SSIM, and LPIPS on the **validation split** (a
+held-out subset of training sequences -- see "Evaluation protocol" below), and
+uses seeded DDIM inference (eta=0) by default so results are reproducible run
+to run. It does not fake or include training results, and it never reads test
+data.
+
+## Evaluation Protocol
+
+- **Only `train_mode="dehaze"` measures video dehazing.** It is the default in
+  `src/config.py`. `train_mode="reconstruct_synthetic"` (legacy name
+  `"reconstruct"`) uses ground-truth clean frames as temporal references and
+  paints synthetic haze inside a random mask onto an otherwise-clean target;
+  real REVIDE haze never reaches the model in that mode. It is **not a
+  dehazing benchmark** -- it exists only to explain/reproduce previously
+  reported numbers, and `src/dataset.py` logs a loud warning whenever it is
+  selected.
+- **The validation split is a held-out subset of TRAINING sequences, never
+  the test set.** `src/dataset.py`'s `split_train_val_sequence_names()`
+  deterministically partitions ~10% of training sequence names (by name, via
+  a seeded hash, so no clip from a given sequence appears on both sides) into
+  a validation split, seeded by `config.split_seed` (independent of the
+  general training `seed`, so changing the run seed never reshuffles which
+  sequences are held out). `config.root_for_split("val")` resolves to
+  `train_root`, not `test_root`.
+- **Test data is never used for model selection.** `config.test_root` is only
+  meant to be read by `scripts/evaluate_full_test.py`, a final, one-shot,
+  fully seeded evaluation over the *entire* test set with no sample
+  filtering, scoring, or "good candidate" selection of any kind. Checkpoints
+  must be selected using validation metrics only (as `src/train.py` already
+  does), never by peeking at test-set performance.
+- **Reported metrics**: PSNR, SSIM, LPIPS, plus a flow-warped temporal
+  consistency error (RAFT-warp prediction t-1 into t, mask invalid/occluded
+  pixels via forward-backward flow consistency, report mean L1 on the valid
+  pixels) -- not a naive inter-frame difference, since a naive diff conflates
+  real motion with actual flicker.
+- **Determinism**: inference uses DDIM with eta=0 and a per-sample,
+  per-frame-index deterministic noise generator (`src/seeding.py`), so two
+  runs with the same seed produce identical metrics. Random per-run noise
+  previously caused a 1.67 dB spread between two runs of the same
+  configuration; this is now fixed by default.
+
+### Running the full test-set evaluation
+
+```bash
+python scripts/evaluate_full_test.py \
+  --checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/best_psnr \
+  --num-steps 30 \
+  --seed 1234
+```
+
+Writes a JSON report (per-clip and aggregate PSNR/SSIM/LPIPS/temporal
+consistency, plus `N`, `seed`, `num_inference_steps`, `checkpoint_path`,
+`train_mode`, `mask_mode`, and the current git commit hash) next to the
+checkpoint by default, or to `--output`.
+
+### Diffusion-only baseline (isolating the temporal contribution)
+
+```bash
+python scripts/evaluate_full_test.py \
+  --checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/best_psnr \
+  --num-steps 30 --seed 1234 --diffusion-only
+```
+
+Runs the SD inpainting backbone frame-by-frame with no RAFT, ConvLSTM,
+temporal transformer, or reference selector, reusing the same eval script and
+JSON schema, so the temporal stack's contribution can be measured by
+comparing against the full-pipeline run above.
 
 ## How to Run Inference
 
@@ -297,6 +376,7 @@ TRDN-Video-Dehazing/
     diffusion_adapter.py
     losses.py
     metrics.py
+    seeding.py
     train.py
     validate.py
     inference.py
@@ -304,6 +384,8 @@ TRDN-Video-Dehazing/
     train_colab.py
     validate_colab.py
     inference_colab.py
+    evaluate_full_test.py
+  tests/
   outputs/
   checkpoints/
   logs/
