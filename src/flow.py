@@ -75,6 +75,37 @@ def compute_warped_references_batch(
     return warped, flow_stack
 
 
+def flow_warped_temporal_consistency_error(
+    prev_pred: torch.Tensor, curr_pred: torch.Tensor, raft_model: nn.Module, fb_threshold: float = 1.0
+) -> Tuple[float, float]:
+    """Flow-warped temporal consistency error between two consecutive predictions.
+
+    Warps ``prev_pred`` into ``curr_pred``'s coordinates with RAFT flow (via the
+    existing `warp_with_flow` utility) and reports the mean L1 error, restricted
+    to pixels that pass a forward-backward flow consistency check (standard
+    occlusion/invalid-flow masking: a pixel is trusted only if following the
+    forward flow and then the backward flow returns close to the start).
+
+    Returns:
+        (mean_l1_error_on_valid_pixels, fraction_of_pixels_marked_valid)
+    """
+    flow_fwd = compute_raft_flow(raft_model, prev_pred, curr_pred)
+    flow_bwd = compute_raft_flow(raft_model, curr_pred, prev_pred)
+    warped_prev = warp_with_flow(prev_pred, flow_fwd)
+    warped_flow_bwd = warp_with_flow(flow_bwd, flow_fwd)
+
+    fb_diff = torch.norm(flow_fwd + warped_flow_bwd, dim=1, keepdim=True)
+    flow_mag_sq = torch.sum(flow_fwd**2, dim=1, keepdim=True) + torch.sum(warped_flow_bwd**2, dim=1, keepdim=True)
+    threshold = 0.01 * flow_mag_sq + fb_threshold
+    valid_mask = (fb_diff < threshold).float()
+
+    error = torch.abs(warped_prev - curr_pred) * valid_mask
+    valid_pixels = valid_mask.sum().clamp_min(1.0)
+    mean_l1 = (error.sum() / (valid_pixels * curr_pred.shape[1])).item()
+    coverage = valid_mask.mean().item()
+    return mean_l1, coverage
+
+
 def flow_to_rgb(flow: torch.Tensor) -> torch.Tensor:
     if flow.ndim == 3:
         flow = flow.unsqueeze(0)

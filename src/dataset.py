@@ -1,3 +1,5 @@
+import hashlib
+import logging
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -12,6 +14,29 @@ from .masks import generate_haze_mask
 
 CLEAN_DIR_NAMES = {"gt", "GT", "clean", "Clean", "clear", "Clear", "target", "targets", "groundtruth", "ground_truth"}
 HAZY_DIR_NAMES = {"hazy", "Hazy", "input", "Input", "inputs", "fog", "Fog", "degraded", "Degraded"}
+
+# "reconstruct" is the legacy name for what is now called "reconstruct_synthetic".
+# It leaks ground truth into the temporal references (see the branch below) and
+# is kept only so previously-reported numbers can be explained/reproduced.
+TRAIN_MODES = {"dehaze", "reconstruct_synthetic"}
+_LEGACY_TRAIN_MODE_ALIASES = {"reconstruct": "reconstruct_synthetic"}
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_train_mode(train_mode: str) -> str:
+    if train_mode in _LEGACY_TRAIN_MODE_ALIASES:
+        resolved = _LEGACY_TRAIN_MODE_ALIASES[train_mode]
+        logger.warning(
+            "train_mode=%r is a deprecated alias for %r. Update callers to use %r directly.",
+            train_mode,
+            resolved,
+            resolved,
+        )
+        return resolved
+    if train_mode not in TRAIN_MODES:
+        raise ValueError(f"train_mode must be one of {sorted(TRAIN_MODES)}, got {train_mode!r}")
+    return train_mode
 
 
 def image_to_tensor(path: Path) -> torch.Tensor:
@@ -86,6 +111,35 @@ def discover_revide_sequences(root: Path, split: Optional[str], extensions: Tupl
     return sequences
 
 
+def _sequence_name_fraction(name: str, seed: int) -> float:
+    """Deterministic pseudo-random value in [0, 1) derived from (seed, name)."""
+    digest = hashlib.sha256(f"{seed}:{name}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
+
+
+def split_train_val_sequence_names(
+    sequence_names: List[str], val_fraction: float = 0.1, seed: int = 1234
+) -> Tuple[List[str], List[str]]:
+    """Deterministically partition sequence names into (train, val) with no overlap.
+
+    Whole sequences are assigned to one side or the other (never split within a
+    sequence), so clips never leak across the train/val boundary. The partition
+    only depends on (seed, sequence name), not on filesystem order, so it is
+    stable across reruns and across changes to how many sequences exist.
+    """
+    unique_names = sorted(set(sequence_names))
+    if not unique_names:
+        return [], []
+    ranked = sorted(unique_names, key=lambda name: _sequence_name_fraction(name, seed))
+    val_count = round(len(unique_names) * val_fraction)
+    if val_fraction > 0 and val_count == 0 and len(unique_names) > 1:
+        val_count = 1  # guarantee a non-empty val set whenever a fraction was requested and it's feasible
+    val_count = min(val_count, len(unique_names) - 1) if len(unique_names) > 1 else 0
+    val_names = set(ranked[:val_count])
+    train_names = [name for name in unique_names if name not in val_names]
+    return sorted(train_names), sorted(val_names)
+
+
 class REVIDESequenceDataset(Dataset):
     """REVIDE sequence dataset returning the canonical TRDN tensors."""
 
@@ -99,7 +153,11 @@ class REVIDESequenceDataset(Dataset):
         extensions: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"),
         synthetic_if_empty: bool = True,
         max_sequences: Optional[int] = None,
-        train_mode: str = "reconstruct",
+        train_mode: str = "dehaze",
+        mask_mode: str = "auto",
+        val_fraction: float = 0.1,
+        split_seed: int = 1234,
+        include_prev_frame: bool = True,
     ):
         self.root = Path(root)
         self.split = split
@@ -108,41 +166,84 @@ class REVIDESequenceDataset(Dataset):
         self.random_crop = random_crop
         self.extensions = extensions
         self.synthetic_if_empty = synthetic_if_empty
-        if train_mode not in {"dehaze", "reconstruct"}:
-            raise ValueError(f"train_mode must be 'dehaze' or 'reconstruct', got {train_mode!r}")
-        self.train_mode = train_mode
+        self.train_mode = _normalize_train_mode(train_mode)
+        if self.train_mode == "reconstruct_synthetic":
+            logger.warning(
+                "=" * 88
+                + "\nREVIDESequenceDataset: train_mode='reconstruct_synthetic' is ACTIVE.\n"
+                "Temporal references are GROUND-TRUTH CLEAN frames, and the 'hazy' input is\n"
+                "the clean target frame with SYNTHETIC haze painted inside a random mask.\n"
+                "Real REVIDE haze never reaches the model in this mode. This is NOT a\n"
+                "dehazing evaluation; it exists only to reproduce previously-reported numbers.\n"
+                "Use train_mode='dehaze' to measure real video dehazing.\n" + "=" * 88
+            )
+        self.mask_mode = mask_mode
+
+        # Predictive temporal-consistency training (see src/losses.py) needs the
+        # previous frame's own T-length window so a genuine "previous frame
+        # prediction" can be computed and warped forward. Only dehaze mode uses
+        # this; reconstruct_synthetic keeps its original sample count/pairing
+        # unchanged so legacy numbers stay reproducible. Evaluation scripts that
+        # compute temporal consistency directly from consecutive real
+        # predictions (not needed at training time) can pass
+        # include_prev_frame=False to skip the extra I/O.
+        self.needs_prev_frame = self.train_mode == "dehaze" and include_prev_frame
+
         self.sequences = discover_revide_sequences(self.root, split, extensions)
         if max_sequences is not None:
             self.sequences = self.sequences[:max_sequences]
 
+        if split and split.lower() in {"train", "training", "val", "valid", "validation"} and val_fraction > 0:
+            all_names = [sequence["name"] for sequence in self.sequences]
+            train_names, val_names = split_train_val_sequence_names(all_names, val_fraction, split_seed)
+            keep = set(val_names) if split.lower() in {"val", "valid", "validation"} else set(train_names)
+            self.sequences = [sequence for sequence in self.sequences if sequence["name"] in keep]
+
         self.index: List[Tuple[int, int]] = []
+        min_window = seq_len + 1 if self.needs_prev_frame else seq_len
         for seq_idx, sequence in enumerate(self.sequences):
             count = min(len(sequence["hazy_files"]), len(sequence["clean_files"]))
-            for end_idx in range(seq_len - 1, count):
+            for end_idx in range(min_window - 1, count):
                 self.index.append((seq_idx, end_idx))
         self.synthetic_len = 8 if not self.index and synthetic_if_empty else 0
+
+    def _resolve_mask_mode(self) -> str:
+        if self.mask_mode != "auto":
+            return self.mask_mode
+        return "full" if self.train_mode == "dehaze" else "mixed"
 
     def __len__(self) -> int:
         return len(self.index) if self.index else self.synthetic_len
 
-    def _load_real_clip(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str], str]:
+    def _load_real_clip(self, idx: int) -> Dict[str, Any]:
         seq_idx, end_idx = self.index[idx]
         sequence = self.sequences[seq_idx]
         start_idx = end_idx - self.seq_len + 1
-        hazy_paths = sequence["hazy_files"][start_idx : end_idx + 1]
-        clean_paths = sequence["clean_files"][start_idx : end_idx + 1]
-        hazy_frames = torch.stack([image_to_tensor(path) for path in hazy_paths], dim=0)
-        clean_frames = torch.stack([image_to_tensor(path) for path in clean_paths], dim=0)
-        target = image_to_tensor(sequence["clean_files"][end_idx])
-        return hazy_frames, clean_frames, target, [str(path) for path in hazy_paths], sequence["name"]
+        ext_start = start_idx - 1 if self.needs_prev_frame else start_idx
+        hazy_paths_ext = sequence["hazy_files"][ext_start : end_idx + 1]
+        clean_paths_ext = sequence["clean_files"][ext_start : end_idx + 1]
+        hazy_ext = torch.stack([image_to_tensor(path) for path in hazy_paths_ext], dim=0)
+        clean_ext = torch.stack([image_to_tensor(path) for path in clean_paths_ext], dim=0)
 
-    def _load_synthetic_clip(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str], str]:
+        result: Dict[str, Any] = {
+            "hazy_frames": hazy_ext[1:] if self.needs_prev_frame else hazy_ext,
+            "clean_frames": clean_ext[1:] if self.needs_prev_frame else clean_ext,
+            "paths": [str(path) for path in (hazy_paths_ext[1:] if self.needs_prev_frame else hazy_paths_ext)],
+            "name": sequence["name"],
+        }
+        if self.needs_prev_frame:
+            result["prev_hazy_frames"] = hazy_ext[:-1]
+            result["prev_clean_frames"] = clean_ext[:-1]
+        return result
+
+    def _load_synthetic_clip(self, idx: int) -> Dict[str, Any]:
         height = width = max(self.crop_size, 256)
+        total_len = self.seq_len + 1 if self.needs_prev_frame else self.seq_len
         yy, xx = torch.meshgrid(torch.linspace(0, 1, height), torch.linspace(0, 1, width), indexing="ij")
-        clean_frames = []
-        for tidx in range(self.seq_len):
+        clean_frames_ext = []
+        for tidx in range(total_len):
             shift = 0.02 * (idx + tidx)
-            clean_frames.append(
+            clean_frames_ext.append(
                 torch.stack(
                     [
                         (xx + shift).fmod(1.0),
@@ -152,34 +253,40 @@ class REVIDESequenceDataset(Dataset):
                     dim=0,
                 )
             )
-        target = clean_frames[-1].clone()
-        clean_stack = torch.stack(clean_frames, dim=0)
-        hazy_stack = torch.stack([torch.clamp(frame * 0.65 + 0.35, 0, 1) for frame in clean_frames], dim=0)
-        return hazy_stack, clean_stack, target, [f"synthetic_{idx}_{tidx}.png" for tidx in range(self.seq_len)], "synthetic"
+        clean_ext = torch.stack(clean_frames_ext, dim=0)
+        hazy_ext = torch.stack([torch.clamp(frame * 0.65 + 0.35, 0, 1) for frame in clean_frames_ext], dim=0)
 
-    def _crop_triplet(
-        self, hazy_frames: torch.Tensor, clean_frames: torch.Tensor, target: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        offset = 1 if self.needs_prev_frame else 0
+        result: Dict[str, Any] = {
+            "hazy_frames": hazy_ext[offset:],
+            "clean_frames": clean_ext[offset:],
+            "paths": [f"synthetic_{idx}_{tidx}.png" for tidx in range(offset, total_len)],
+            "name": "synthetic",
+        }
+        if self.needs_prev_frame:
+            result["prev_hazy_frames"] = hazy_ext[:-1]
+            result["prev_clean_frames"] = clean_ext[:-1]
+        return result
+
+    def _crop_pair(self, hazy_frames: torch.Tensor, clean_frames: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int, int, int]:
         _, _, height, width = hazy_frames.shape
         crop = min(self.crop_size, height, width)
         if height == crop and width == crop:
-            return hazy_frames, clean_frames, target
+            return hazy_frames, clean_frames, 0, 0, crop
         top = random.randint(0, height - crop) if self.random_crop else (height - crop) // 2
         left = random.randint(0, width - crop) if self.random_crop else (width - crop) // 2
         return (
             hazy_frames[:, :, top : top + crop, left : left + crop],
             clean_frames[:, :, top : top + crop, left : left + crop],
-            target[:, top : top + crop, left : left + crop],
+            top,
+            left,
+            crop,
         )
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        if self.index:
-            hazy_frames, clean_frames, target, paths, name = self._load_real_clip(idx)
-        else:
-            hazy_frames, clean_frames, target, paths, name = self._load_synthetic_clip(idx)
-        hazy_frames, clean_frames, target = self._crop_triplet(hazy_frames, clean_frames, target)
+    def _build_window(self, hazy_frames: torch.Tensor, clean_frames: torch.Tensor) -> Dict[str, torch.Tensor]:
+        target = clean_frames[-1]
         _, height, width = target.shape
-        mask = generate_haze_mask(height, width, mode="mixed").float()
+        mask = generate_haze_mask(height, width, mode=self._resolve_mask_mode()).float()
         if self.train_mode == "dehaze":
             frames = hazy_frames
             corrupted = hazy_frames[-1]
@@ -194,9 +301,39 @@ class REVIDESequenceDataset(Dataset):
             "mask": mask.float(),
             "corrupted_frame": corrupted.float(),
             "warped_references": frames[:-1].clone().float(),
-            "clean_frames": clean_frames.float(),
-            "hazy_frames": hazy_frames.float(),
-            "train_mode": self.train_mode,
-            "sequence_name": name,
-            "frame_paths": paths,
         }
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        clip = self._load_real_clip(idx) if self.index else self._load_synthetic_clip(idx)
+        hazy_frames, clean_frames = clip["hazy_frames"], clip["clean_frames"]
+
+        if self.needs_prev_frame:
+            # Crop the extended (prev + current) window jointly so both share the
+            # exact same spatial crop before splitting.
+            hazy_ext = torch.cat([clip["prev_hazy_frames"][:1], hazy_frames], dim=0)
+            clean_ext = torch.cat([clip["prev_clean_frames"][:1], clean_frames], dim=0)
+            hazy_ext, clean_ext, *_ = self._crop_pair(hazy_ext, clean_ext)
+            hazy_frames, clean_frames = hazy_ext[1:], clean_ext[1:]
+            prev_hazy = torch.cat([hazy_ext[:1], hazy_ext[1:-1]], dim=0)
+            prev_clean = torch.cat([clean_ext[:1], clean_ext[1:-1]], dim=0)
+        else:
+            hazy_frames, clean_frames, *_ = self._crop_pair(hazy_frames, clean_frames)
+
+        sample = self._build_window(hazy_frames, clean_frames)
+        sample.update(
+            {
+                "clean_frames": clean_frames.float(),
+                "hazy_frames": hazy_frames.float(),
+                "train_mode": self.train_mode,
+                "sequence_name": clip["name"],
+                "frame_paths": clip["paths"],
+            }
+        )
+        if self.needs_prev_frame:
+            prev_window = self._build_window(prev_hazy, prev_clean)
+            sample["prev_frames"] = prev_window["frames"]
+            sample["prev_current_frame"] = prev_window["current_frame"]
+            sample["prev_target_frame"] = prev_window["target_frame"]
+            sample["prev_mask"] = prev_window["mask"]
+            sample["prev_corrupted_frame"] = prev_window["corrupted_frame"]
+        return sample

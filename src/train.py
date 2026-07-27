@@ -1,5 +1,6 @@
 import json
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -9,7 +10,15 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from .assertions import assert_frames, assert_latents, assert_mask, assert_reference_weights, assert_temporal_memory, assert_warped_references
+from .assertions import (
+    assert_frames,
+    assert_image,
+    assert_latents,
+    assert_mask,
+    assert_reference_weights,
+    assert_temporal_memory,
+    assert_warped_references,
+)
 from .config import TRDNConfig
 from .convlstm import TemporalMemoryModule
 from .dataset import REVIDESequenceDataset
@@ -20,6 +29,7 @@ from .reference_selector import ReferenceSelectionModule
 from .diffusion_adapter import TemporalConditioningAdapter, load_diffusion_backbone
 from .temporal_transformer import TemporalRetrievalTransformer
 from .validate import validate_trdn
+from .warp import warp_with_flow
 
 
 def make_datasets(config: TRDNConfig) -> Tuple[REVIDESequenceDataset, REVIDESequenceDataset]:
@@ -32,6 +42,9 @@ def make_datasets(config: TRDNConfig) -> Tuple[REVIDESequenceDataset, REVIDESequ
         extensions=config.image_extensions,
         synthetic_if_empty=True,
         train_mode=config.train_mode,
+        mask_mode=config.mask_mode,
+        val_fraction=config.val_fraction,
+        split_seed=config.split_seed,
     )
     val_dataset = REVIDESequenceDataset(
         config.root_for_split(config.val_split),
@@ -42,6 +55,10 @@ def make_datasets(config: TRDNConfig) -> Tuple[REVIDESequenceDataset, REVIDESequ
         extensions=config.image_extensions,
         synthetic_if_empty=True,
         train_mode=config.train_mode,
+        mask_mode=config.mask_mode,
+        val_fraction=config.val_fraction,
+        split_seed=config.split_seed,
+        include_prev_frame=False,  # validation only ever runs infer_dehazed_batch, which doesn't use it
     )
     return train_dataset, val_dataset
 
@@ -91,6 +108,77 @@ def build_optimizer(config: TRDNConfig, unet, temporal_memory, temporal_transfor
             temporal_params += list(temporal_transformer.parameters())
         groups.append({"params": temporal_params, "lr": config.temporal_learning_rate})
     return torch.optim.AdamW(groups, weight_decay=config.weight_decay)
+
+
+def forward_window_prediction(
+    accelerator: Accelerator,
+    diffusion: Dict[str, Any],
+    temporal_memory: torch.nn.Module,
+    temporal_transformer: torch.nn.Module | None,
+    reference_selector: torch.nn.Module,
+    conditioning_adapter: torch.nn.Module,
+    raft_model: torch.nn.Module | None,
+    frames: torch.Tensor,
+    mask: torch.Tensor,
+    corrupted: torch.Tensor,
+    target: torch.Tensor,
+    seq_len: int,
+    autocast: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """Run the full temporal + diffusion stack for one [B,T,3,H,W] window.
+
+    Shared by the main (current-frame) training step and, in dehaze mode, the
+    extra previous-frame pass used to compute a true predictive temporal
+    consistency loss (see predictive_temporal_consistency_loss in src/losses.py).
+    """
+    assert_frames(frames, seq_len=seq_len)
+    assert_mask(mask, target)
+    current = frames[:, -1]
+
+    with torch.no_grad():
+        warped_refs, flows = compute_warped_references_batch(frames, raft_model)
+    assert_warped_references(warped_refs, seq_len=seq_len)
+
+    aligned_frames = torch.cat([warped_refs, current.unsqueeze(1)], dim=1)
+    ctx = accelerator.autocast() if autocast else nullcontext()
+    with ctx:
+        memory = temporal_memory(aligned_frames)
+        prior_logits = None
+        if temporal_transformer is not None:
+            transformer_out = temporal_transformer(aligned_frames, memory)
+            memory = transformer_out["enhanced_memory"]
+            prior_logits = transformer_out["reference_prior_logits"]
+        assert_temporal_memory(memory, batch=frames.shape[0])
+        ref = reference_selector(warped_refs, memory, prior_logits=prior_logits)
+        assert_reference_weights(ref["weights"], seq_len=seq_len)
+        cond_tokens = conditioning_adapter(memory, ref["reference_feature"])
+        text = get_text_embeddings(diffusion["tokenizer"], diffusion["text_encoder"], frames.shape[0]).to(cond_tokens.dtype)
+        encoder_hidden_states = torch.cat([text, cond_tokens], dim=1)
+
+        with torch.no_grad():
+            latents = encode_images_to_latents(diffusion["vae"], target)
+        assert_latents(latents, target)
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(
+            0, diffusion["noise_scheduler"].config.num_train_timesteps, (latents.shape[0],), device=latents.device
+        ).long()
+        noisy_latents = diffusion["noise_scheduler"].add_noise(latents, noise, timesteps)
+        model_input = prepare_inpainting_inputs(diffusion["vae"], noisy_latents, mask, corrupted)
+        noise_pred = diffusion["unet"](model_input, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+
+        diffusion_loss = F.mse_loss(noise_pred.float(), noise.float())
+        pred_x0 = estimate_x0_from_epsilon(diffusion["noise_scheduler"], noisy_latents, timesteps, noise_pred)
+        pred_img = decode_latents_to_images(diffusion["vae"], pred_x0)
+
+    return {
+        "pred_img": pred_img,
+        "diffusion_loss": diffusion_loss,
+        "warped_refs": warped_refs,
+        "flows": flows,
+        "weights": ref["weights"],
+        "weighted_reference": ref["weighted_reference"],
+        "current": current,
+    }
 
 
 def save_checkpoint(accelerator: Accelerator, checkpoint_dir: Path, step: int, best_psnr: float, best_ssim: float, name: str | None = None) -> None:
@@ -164,51 +252,71 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                 target = batch["target_frame"].to(accelerator.device, non_blocking=True)
                 mask = batch["mask"].to(accelerator.device, non_blocking=True)
                 corrupted = batch["corrupted_frame"].to(accelerator.device, non_blocking=True)
-                current = batch["current_frame"].to(accelerator.device, non_blocking=True)
-                assert_frames(frames, seq_len=config.seq_len)
-                assert_mask(mask, target)
 
-                with torch.no_grad():
-                    warped_refs, _flows = compute_warped_references_batch(frames, raft_model)
-                assert_warped_references(warped_refs, seq_len=config.seq_len)
+                current_out = forward_window_prediction(
+                    accelerator,
+                    diffusion,
+                    temporal_memory,
+                    temporal_transformer,
+                    reference_selector,
+                    conditioning_adapter,
+                    raft_model,
+                    frames,
+                    mask,
+                    corrupted,
+                    target,
+                    seq_len=config.seq_len,
+                )
+                pred_img = current_out["pred_img"]
+                warped_refs = current_out["warped_refs"]
+                flows = current_out["flows"]
+                current = current_out["current"]
 
-                aligned_frames = torch.cat([warped_refs, current.unsqueeze(1)], dim=1)
-                with accelerator.autocast():
-                    memory = temporal_memory(aligned_frames)
-                    prior_logits = None
-                    if temporal_transformer is not None:
-                        transformer_out = temporal_transformer(aligned_frames, memory)
-                        memory = transformer_out["enhanced_memory"]
-                        prior_logits = transformer_out["reference_prior_logits"]
-                    assert_temporal_memory(memory, batch=frames.shape[0])
-                    ref = reference_selector(warped_refs, memory, prior_logits=prior_logits)
-                    assert_reference_weights(ref["weights"], seq_len=config.seq_len)
-                    cond_tokens = conditioning_adapter(memory, ref["reference_feature"])
-                    text = get_text_embeddings(diffusion["tokenizer"], diffusion["text_encoder"], frames.shape[0]).to(cond_tokens.dtype)
-                    encoder_hidden_states = torch.cat([text, cond_tokens], dim=1)
-
+                if config.train_mode == "dehaze" and "prev_frames" in batch:
+                    # Extra no-grad pass on the previous frame's window to get a
+                    # genuine predicted t-1 frame, used only as a detached anchor
+                    # for predictive_temporal_consistency_loss below.
+                    prev_frames = batch["prev_frames"].to(accelerator.device, non_blocking=True)
+                    prev_target = batch["prev_target_frame"].to(accelerator.device, non_blocking=True)
+                    prev_mask = batch["prev_mask"].to(accelerator.device, non_blocking=True)
+                    prev_corrupted = batch["prev_corrupted_frame"].to(accelerator.device, non_blocking=True)
                     with torch.no_grad():
-                        latents = encode_images_to_latents(diffusion["vae"], target)
-                    assert_latents(latents, target)
-                    noise = torch.randn_like(latents)
-                    timesteps = torch.randint(
-                        0, diffusion["noise_scheduler"].config.num_train_timesteps, (latents.shape[0],), device=latents.device
-                    ).long()
-                    noisy_latents = diffusion["noise_scheduler"].add_noise(latents, noise, timesteps)
-                    model_input = prepare_inpainting_inputs(diffusion["vae"], noisy_latents, mask, corrupted)
-                    noise_pred = diffusion["unet"](model_input, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+                        prev_out = forward_window_prediction(
+                            accelerator,
+                            diffusion,
+                            temporal_memory,
+                            temporal_transformer,
+                            reference_selector,
+                            conditioning_adapter,
+                            raft_model,
+                            prev_frames,
+                            prev_mask,
+                            prev_corrupted,
+                            prev_target,
+                            seq_len=config.seq_len,
+                        )
+                    # flows[:, -1] is the RAFT flow from frames[:, -2] (=t-1) to
+                    # frames[:, -1] (=t) -- the same physical frame that
+                    # prev_out["pred_img"] predicts, so it is the correct flow
+                    # to warp the previous prediction into the current frame.
+                    temporal_loss = loss_bundle.predictive_temporal_consistency_loss(
+                        pred_img, prev_out["pred_img"], flows[:, -1]
+                    )
+                else:
+                    temporal_loss = loss_bundle.legacy_temporal_consistency_loss(pred_img, warped_refs, current_out["weights"])
 
-                    diffusion_loss = F.mse_loss(noise_pred.float(), noise.float())
-                    pred_x0 = estimate_x0_from_epsilon(diffusion["noise_scheduler"], noisy_latents, timesteps, noise_pred)
-                    pred_img = decode_latents_to_images(diffusion["vae"], pred_x0)
+                with accelerator.autocast():
                     parts = {
-                        "diffusion": diffusion_loss,
+                        "diffusion": current_out["diffusion_loss"],
                         "l1": F.l1_loss(pred_img, target),
                         "lpips": loss_bundle.lpips_loss(pred_img, target),
-                        "temporal": loss_bundle.temporal_consistency_loss(pred_img, warped_refs, ref["weights"]),
-                        "flow": loss_bundle.flow_consistency_loss(warped_refs, current, ref["weights"]),
-                        "reference": loss_bundle.reference_preservation_loss(pred_img, ref["weighted_reference"], mask),
+                        "temporal": temporal_loss,
+                        "flow": loss_bundle.flow_consistency_loss(warped_refs, current, current_out["weights"]),
                     }
+                    if config.w_reference != 0.0:
+                        parts["reference"] = loss_bundle.reference_preservation_loss(
+                            pred_img, current_out["weighted_reference"], mask
+                        )
                     total_loss = weighted_total_loss(config, parts)
                 accelerator.backward(total_loss)
                 grad_norm = None
@@ -269,10 +377,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
     return {"step": float(global_step), "best_psnr": best_psnr, "best_ssim": best_ssim}
 
 
-def dry_run_shape_test(seq_len: int = 10, image_size: int = 64, batch_size: int = 1) -> Dict[str, tuple]:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    frames = torch.rand(batch_size, seq_len, 3, image_size, image_size, device=device)
-    mask = torch.rand(batch_size, 1, image_size, image_size, device=device)
+def _run_temporal_stack(frames: torch.Tensor, seq_len: int, device: str) -> Dict[str, Any]:
     warped_refs, flows = compute_warped_references_batch(frames, raft_model=None)
     memory_module = TemporalMemoryModule(hidden_dim=64).to(device)
     transformer = TemporalRetrievalTransformer(
@@ -291,14 +396,71 @@ def dry_run_shape_test(seq_len: int = 10, image_size: int = 64, batch_size: int 
     ref = selector(warped_refs, memory, prior_logits=transformer_out["reference_prior_logits"])
     tokens = adapter(memory, ref["reference_feature"])
     return {
+        "warped_refs": warped_refs,
+        "flows": flows,
+        "memory": memory,
+        "transformer_out": transformer_out,
+        "ref": ref,
+        "tokens": tokens,
+    }
+
+
+def dry_run_shape_test(
+    seq_len: int = 10, image_size: int = 64, batch_size: int = 1, train_mode: str = "dehaze", mask_mode: str = "auto"
+) -> Dict[str, tuple]:
+    """Exercise dataset construction (synthetic fallback, no real REVIDE needed)
+    plus the temporal stack for a given train_mode/mask_mode, without loading
+    Stable Diffusion. Must pass for both "dehaze" and "reconstruct_synthetic".
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dataset = REVIDESequenceDataset(
+        root="__dry_run_no_such_path__",
+        split="train",
+        seq_len=seq_len,
+        crop_size=image_size,
+        random_crop=False,
+        synthetic_if_empty=True,
+        train_mode=train_mode,
+        mask_mode=mask_mode,
+    )
+    batch = {
+        key: (value.unsqueeze(0).to(device) if torch.is_tensor(value) else [value]) for key, value in dataset[0].items()
+    }
+    frames = batch["frames"]
+    mask = batch["mask"]
+    current_stack = _run_temporal_stack(frames, seq_len, device)
+
+    result = {
+        "train_mode": dataset.train_mode,
+        "mask_mode": dataset._resolve_mask_mode(),
         "frames": tuple(frames.shape),
         "current_hazy": tuple(frames[:, -1].shape),
-        "target_clean": tuple(frames[:, -1].shape),
+        "target_clean": tuple(batch["target_frame"].shape),
         "mask": tuple(mask.shape),
-        "warped_references": tuple(warped_refs.shape),
-        "flows": tuple(flows.shape),
-        "temporal_memory": tuple(memory.shape),
-        "transformer_tokens": tuple(transformer_out["tokens"].shape),
-        "reference_weights": tuple(ref["weights"].shape),
-        "conditioning_tokens": tuple(tokens.shape),
+        "warped_references": tuple(current_stack["warped_refs"].shape),
+        "flows": tuple(current_stack["flows"].shape),
+        "temporal_memory": tuple(current_stack["memory"].shape),
+        "transformer_tokens": tuple(current_stack["transformer_out"]["tokens"].shape),
+        "reference_weights": tuple(current_stack["ref"]["weights"].shape),
+        "conditioning_tokens": tuple(current_stack["tokens"].shape),
     }
+
+    if "prev_frames" in batch:
+        prev_stack = _run_temporal_stack(batch["prev_frames"], seq_len, device)
+        # Verify the predictive temporal-consistency wiring's shapes line up:
+        # a placeholder "previous prediction" warped by the current window's
+        # t-1 -> t flow must match the current prediction's shape exactly.
+        placeholder_pred_current = frames[:, -1]
+        placeholder_pred_prev = batch["prev_frames"][:, -1]
+        warped_prev = warp_with_flow(placeholder_pred_prev, current_stack["flows"][:, -1])
+        assert_image(warped_prev, channels=3, name="warped_prev_prediction")
+        if tuple(warped_prev.shape) != tuple(placeholder_pred_current.shape):
+            raise ValueError(
+                f"predictive temporal consistency shape mismatch: {tuple(warped_prev.shape)} vs {tuple(placeholder_pred_current.shape)}"
+            )
+        result["prev_frames"] = tuple(batch["prev_frames"].shape)
+        result["prev_target_clean"] = tuple(batch["prev_target_frame"].shape)
+        result["prev_warped_references"] = tuple(prev_stack["warped_refs"].shape)
+        result["predictive_temporal_warp"] = tuple(warped_prev.shape)
+
+    return result

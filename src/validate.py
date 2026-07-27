@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -8,6 +8,9 @@ from .assertions import assert_frames, assert_mask, assert_reference_weights, as
 from .diffusion_adapter import decode_latents_to_images, encode_images_to_latents, get_text_embeddings
 from .flow import compute_warped_references_batch
 from .metrics import psnr_metric, ssim_metric
+from .seeding import derive_generator
+
+DEFAULT_EVAL_SEED = 1234
 
 
 @torch.no_grad()
@@ -23,7 +26,19 @@ def infer_dehazed_batch(
     device: str,
     raft_model: torch.nn.Module | None = None,
     num_steps: int = 30,
+    seed: Optional[int] = DEFAULT_EVAL_SEED,
+    generator: Optional[torch.Generator] = None,
+    sample_ids: Optional[List[str]] = None,
+    ddim_eta: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
+    """Run the full TRDN pipeline for one batch.
+
+    Deterministic by default: pass `seed` (and optionally `sample_ids`, e.g.
+    [f"{clip_name}:{frame_index}"]) to derive a reproducible per-call noise
+    generator, or pass an explicit `generator`. DDIM sampling uses eta=0 so the
+    only randomness is the initial latent noise -- fixing that makes the whole
+    trajectory reproducible.
+    """
     frames = frames.to(device)
     mask = mask.to(device)
     corrupted = corrupted.to(device)
@@ -32,6 +47,8 @@ def infer_dehazed_batch(
     batch = frames.shape[0]
     scheduler = diffusion["inference_scheduler"]
     scheduler.set_timesteps(num_steps, device=device)
+    if generator is None:
+        generator = derive_generator(seed if seed is not None else 0, *(sample_ids or ["batch"]), device=device)
 
     warped_refs, flows = compute_warped_references_batch(frames, raft_model)
     assert_warped_references(warped_refs, seq_len=frames.shape[1])
@@ -53,7 +70,7 @@ def infer_dehazed_batch(
     encoder_hidden_states = torch.cat([text, cond_tokens], dim=1)
 
     latent_shape = (batch, 4, frames.shape[-2] // 8, frames.shape[-1] // 8)
-    latents = torch.randn(latent_shape, device=device, dtype=cond_tokens.dtype) * scheduler.init_noise_sigma
+    latents = torch.randn(latent_shape, generator=generator, device=device, dtype=cond_tokens.dtype) * scheduler.init_noise_sigma
     mask_latent = torch.nn.functional.interpolate(mask.float(), size=latents.shape[-2:], mode="nearest").to(
         device, latents.dtype
     )
@@ -62,7 +79,7 @@ def infer_dehazed_batch(
     for timestep in tqdm(scheduler.timesteps, desc="DDIM inference", leave=False):
         model_input = torch.cat([latents, mask_latent, masked_latents], dim=1)
         noise_pred = diffusion["unet"](model_input, timestep, encoder_hidden_states=encoder_hidden_states).sample
-        latents = scheduler.step(noise_pred, timestep, latents).prev_sample
+        latents = scheduler.step(noise_pred, timestep, latents, eta=ddim_eta, generator=generator).prev_sample
 
     return {
         "prediction": decode_latents_to_images(diffusion["vae"], latents),
@@ -73,6 +90,51 @@ def infer_dehazed_batch(
         "memory": memory,
         "transformer_tokens": transformer_tokens,
     }
+
+
+@torch.no_grad()
+def infer_diffusion_only_batch(
+    mask: torch.Tensor,
+    corrupted: torch.Tensor,
+    diffusion: Dict[str, Any],
+    device: str,
+    num_steps: int = 30,
+    seed: Optional[int] = DEFAULT_EVAL_SEED,
+    generator: Optional[torch.Generator] = None,
+    sample_ids: Optional[List[str]] = None,
+    ddim_eta: float = 0.0,
+) -> Dict[str, torch.Tensor]:
+    """Diffusion-only baseline: SD inpainting on a single frame, no temporal modules.
+
+    No RAFT, ConvLSTM, temporal transformer, or reference selector are invoked
+    -- only the frozen/fine-tuned SD inpainting UNet conditioned on text alone.
+    Used to isolate how much of TRDN's performance comes from the temporal
+    stack vs. the diffusion backbone alone (see scripts/evaluate_full_test.py).
+    """
+    mask = mask.to(device)
+    corrupted = corrupted.to(device)
+    assert_mask(mask, corrupted)
+    batch = corrupted.shape[0]
+    scheduler = diffusion["inference_scheduler"]
+    scheduler.set_timesteps(num_steps, device=device)
+    if generator is None:
+        generator = derive_generator(seed if seed is not None else 0, *(sample_ids or ["batch"]), device=device)
+
+    text = get_text_embeddings(diffusion["tokenizer"], diffusion["text_encoder"], batch)
+
+    latent_shape = (batch, 4, corrupted.shape[-2] // 8, corrupted.shape[-1] // 8)
+    latents = torch.randn(latent_shape, generator=generator, device=device, dtype=text.dtype) * scheduler.init_noise_sigma
+    mask_latent = torch.nn.functional.interpolate(mask.float(), size=latents.shape[-2:], mode="nearest").to(
+        device, latents.dtype
+    )
+    masked_latents = encode_images_to_latents(diffusion["vae"], corrupted).to(latents.dtype)
+
+    for timestep in tqdm(scheduler.timesteps, desc="Diffusion-only inference", leave=False):
+        model_input = torch.cat([latents, mask_latent, masked_latents], dim=1)
+        noise_pred = diffusion["unet"](model_input, timestep, encoder_hidden_states=text).sample
+        latents = scheduler.step(noise_pred, timestep, latents, eta=ddim_eta, generator=generator).prev_sample
+
+    return {"prediction": decode_latents_to_images(diffusion["vae"], latents)}
 
 
 @torch.no_grad()
@@ -88,6 +150,7 @@ def validate_trdn(
     raft_model: torch.nn.Module | None = None,
     max_batches: int = 8,
     num_steps: int = 10,
+    seed: Optional[int] = DEFAULT_EVAL_SEED,
 ) -> Dict[str, float]:
     diffusion["unet"].eval()
     temporal_memory.eval()
@@ -104,6 +167,8 @@ def validate_trdn(
         target = batch["target_frame"].to(device)
         mask = batch["mask"].to(device)
         corrupted = batch["corrupted_frame"].to(device)
+        sequence_name = batch.get("sequence_name", [f"batch{batch_idx}"])
+        sample_ids = [f"{sequence_name[0] if isinstance(sequence_name, list) else sequence_name}:{batch_idx}"]
         output = infer_dehazed_batch(
             frames,
             mask,
@@ -116,6 +181,8 @@ def validate_trdn(
             device,
             raft_model=raft_model,
             num_steps=num_steps,
+            seed=seed,
+            sample_ids=sample_ids,
         )
         pred = output["prediction"]
         psnrs.append(psnr_metric(pred[0], target[0]))

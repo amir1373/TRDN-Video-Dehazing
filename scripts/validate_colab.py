@@ -54,6 +54,10 @@ def main():
         extensions=config.image_extensions,
         synthetic_if_empty=True,
         train_mode=config.train_mode,
+        mask_mode=config.mask_mode,
+        val_fraction=config.val_fraction,
+        split_seed=config.split_seed,
+        include_prev_frame=False,
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     metrics = validate_trdn(

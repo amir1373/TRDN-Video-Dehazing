@@ -48,7 +48,33 @@ def perlin_like_mask(height: int, width: int, grid: int = 8, threshold: float = 
     return torch.from_numpy(mask).unsqueeze(0).float()
 
 
+def full_frame_mask(height: int, width: int) -> torch.Tensor:
+    """All-ones mask: tells the SD inpainting interface to restore the entire frame.
+
+    Real haze is global, not confined to a random region, so this is the only
+    mask mode that is semantically meaningful for dehazing. Everything else in
+    this module generates a spatially-localized synthetic occlusion mask that
+    has no relationship to real haze and exists only to support the legacy
+    ``reconstruct_synthetic`` train mode (see src/dataset.py).
+    """
+    return torch.ones(1, height, width)
+
+
 def generate_haze_mask(height: int, width: int, mode: str = "mixed") -> torch.Tensor:
+    """Generate a mask tensor of shape [1, H, W] in [0, 1].
+
+    Mode meaning depends on how it is used downstream (see src/dataset.py):
+    - "full": all-ones. Full-frame restoration. The only mode that reflects
+      real, global haze. Used by default in ``dehaze`` train mode.
+    - "rectangle"/"ellipse"/"blob"/"perlin"/"mixed": spatially-random
+      synthetic occlusion masks with no relationship to real haze. These
+      exist only to reproduce the legacy ``reconstruct_synthetic`` train
+      mode, where the mask marks the region where synthetic haze was painted
+      onto an otherwise-clean frame. Do NOT use these to interpret or
+      evaluate real dehazing performance.
+    """
+    if mode == "full":
+        return full_frame_mask(height, width)
     if mode == "rectangle":
         return random_rectangle_mask(height, width)
     if mode == "ellipse":

@@ -8,10 +8,11 @@ def warp_with_flow(source: torch.Tensor, flow: torch.Tensor, padding_mode: str =
     """Backward-warp source using a pixel flow field.
 
     Shapes:
-        source: [B, C, H, W]
+        source: [B, C, H, W] (any channel count: RGB predictions, or a 2-channel
+            flow field when used for forward-backward consistency checks)
         flow: [B, 2, H, W], x/y pixel displacement
     """
-    assert_image(source, channels=3, name="source")
+    assert_image(source, channels=source.shape[1] if source.ndim == 4 else 3, name="source")
     assert_flow(flow, name="flow")
     batch, _, height, width = source.shape
     if tuple(flow.shape) != (batch, 2, height, width):
