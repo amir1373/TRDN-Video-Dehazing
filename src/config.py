@@ -23,11 +23,39 @@ class TRDNConfig:
     num_workers: int = 2
     mixed_precision: str = "fp16"
     seed: int = 1234
-    train_mode: Literal["dehaze", "reconstruct"] = "reconstruct"
+
+    # "dehaze": real REVIDE hazy frames are both the temporal references and the
+    #   input; target is the real clean frame. This is the actual dehazing task
+    #   and is what the paper's reported numbers must be measured on.
+    # "reconstruct_synthetic" (legacy name: "reconstruct"): clean REVIDE frames
+    #   are used as temporal references, and the "hazy" input is the clean
+    #   target frame with SYNTHETIC haze painted inside a random mask. Real
+    #   REVIDE haze never reaches the model in this mode. It is kept only to
+    #   explain/reproduce previously-reported numbers and is NOT a dehazing
+    #   evaluation. See src/dataset.py for the loud runtime warning this mode
+    #   triggers.
+    train_mode: Literal["dehaze", "reconstruct_synthetic"] = "dehaze"
+
+    # "full": all-ones mask (full-frame restoration). The only mode that is
+    #   semantically meaningful for real dehazing, since haze is global.
+    # "rectangle"/"ellipse"/"blob"/"perlin"/"mixed": spatially-random synthetic
+    #   occlusion masks with no relationship to real haze; only meaningful for
+    #   "reconstruct_synthetic". "auto" resolves to "full" for train_mode
+    #   "dehaze" and "mixed" for "reconstruct_synthetic" (preserves legacy
+    #   behavior of that mode unless explicitly overridden).
+    mask_mode: str = "auto"
 
     train_split: str = "train"
     val_split: str = "val"
     image_extensions: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+    # Validation is a held-out subset of TRAINING sequences (by sequence name,
+    # so no clip overlap with train), never the test set. See root_for_split()
+    # and REVIDESequenceDataset's split logic in src/dataset.py. split_seed is
+    # intentionally separate from `seed` so changing the training run seed
+    # never reshuffles which sequences are held out for validation.
+    val_fraction: float = 0.1
+    split_seed: int = 1234
 
     sd_model_id: str = "runwayml/stable-diffusion-inpainting"
     use_raft_alignment: bool = True
@@ -64,7 +92,10 @@ class TRDNConfig:
     w_lpips: float = 0.05
     w_temporal: float = 0.05
     w_flow: float = 0.05
-    w_reference: float = 0.05
+    # Defaults to 0: reference_preservation_loss pulls predictions toward the
+    # fused (possibly hazy) reference outside the mask, which fights dehazing.
+    # Set explicitly to 0.05 to reproduce legacy reconstruct_synthetic runs.
+    w_reference: float = 0.0
 
     resume_from_checkpoint: str = ""
 
@@ -103,10 +134,17 @@ class TRDNConfig:
         return safe
 
     def root_for_split(self, split: str) -> str:
+        """Resolve a split name to a filesystem root.
+
+        "val"/"validation" resolves to train_root, NOT test_root: validation is
+        a held-out subset of training sequences (see REVIDESequenceDataset),
+        so checkpoints are never selected using test data. test_root is only
+        meant to be read by a final evaluation script (scripts/evaluate_full_test.py).
+        """
         normalized = split.lower()
-        if normalized in {"train", "training"}:
+        if normalized in {"train", "training", "val", "valid", "validation"}:
             return self.train_root
-        if normalized in {"val", "valid", "validation", "test", "testing"}:
+        if normalized in {"test", "testing"}:
             return self.test_root
         return self.dataset_root
 
