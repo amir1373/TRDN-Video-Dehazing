@@ -45,6 +45,9 @@ def make_dataset(config: Any, split: str = "train", crop_size: int | None = None
         extensions=config.image_extensions,
         synthetic_if_empty=True,
         train_mode=config.train_mode,
+        mask_mode=config.mask_mode,
+        val_fraction=config.val_fraction,
+        split_seed=config.split_seed,
     )
 
 
