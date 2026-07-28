@@ -7,6 +7,24 @@ dehazing at all, plus several related issues. This change fixes the pipeline
 to measure the intended task, without changing or inventing any previously
 reported numbers.
 
+### Runtime safety and A40 preparation
+
+- LPIPS initialization now fails loudly and runs a non-zero startup probe
+  instead of silently replacing perceptual loss with zero.
+- Training logs every non-finite loss term and Accelerate-reported scaler
+  overflow, skips the affected update, and records cumulative totals in the
+  run manifest.
+- Optional RAFT flow sanity checks reject non-finite or frame-implausible
+  flow, and bf16 now loads frozen diffusion modules at the requested dtype.
+- Added a strict TODO-only A40 numerics preset, matching run/checkpoint
+  provenance, and warnings when an output directory contains runs with
+  different numerics.
+- Replaced the committed notebook with a `/workspace` RunPod driver that
+  invokes preflight, training, full evaluation, figures, and tables in order.
+- Added the CUDA-only `scripts/benchmark.py` harness. It records measured
+  throughput, memory, numerical changes, scaler skips, data wait, RAFT share,
+  and compile warmup without inventing results on CPU-only systems.
+
 ### Neutral summary
 
 - Default training mode is now dehaze: temporal references and the current

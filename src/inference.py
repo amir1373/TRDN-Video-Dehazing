@@ -36,7 +36,16 @@ def load_runtime(config: TRDNConfig, checkpoint_path: str = "") -> Dict[str, Any
                 diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer
             )
         accelerator.load_state(checkpoint_path)
-    raft_model = load_raft(device, config.freeze_raft) if config.use_raft_alignment and torch.cuda.is_available() else None
+    raft_model = (
+        load_raft(
+            device,
+            config.freeze_raft,
+            config.validate_raft_flow,
+            config.raft_max_flow_factor,
+        )
+        if config.use_raft_alignment and torch.cuda.is_available()
+        else None
+    )
     return {
         "device": device,
         "diffusion": diffusion,

@@ -41,10 +41,12 @@ from src.diffusion_adapter import load_diffusion_backbone
 from src.flow import flow_warped_temporal_consistency_error, load_raft
 from src.losses import LossBundle
 from src.metrics import psnr_metric, ssim_metric
+from src.presets import apply_numerics_preset
 from src.provenance import (
     append_evaluation_to_manifest,
     load_checkpoint_metadata,
     peak_gpu_memory_bytes,
+    numerics_settings,
     validate_checkpoint_modes,
     write_json,
 )
@@ -79,7 +81,16 @@ def load_runtime_for_eval(config: TRDNConfig, checkpoint_path: str, device: str)
                 diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer
             )
         accelerator.load_state(checkpoint_path)
-    raft_model = load_raft(device, config.freeze_raft) if torch.cuda.is_available() else None
+    raft_model = (
+        load_raft(
+            device,
+            config.freeze_raft,
+            config.validate_raft_flow,
+            config.raft_max_flow_factor,
+        )
+        if torch.cuda.is_available()
+        else None
+    )
     return {
         "diffusion": diffusion,
         "temporal_memory": temporal_memory,
@@ -142,7 +153,12 @@ def evaluate(
     clip_names = {
         seq_idx: (dataset.sequences[seq_idx]["name"] if dataset.sequences else "synthetic") for seq_idx in by_clip
     }
-    consistency_raft = runtime["raft_model"] or load_raft(device, config.freeze_raft)
+    consistency_raft = runtime["raft_model"] or load_raft(
+        device,
+        config.freeze_raft,
+        config.validate_raft_flow,
+        config.raft_max_flow_factor,
+    )
 
     per_clip_results: List[Dict[str, Any]] = []
     all_psnr: List[float] = []
@@ -288,6 +304,7 @@ def evaluate(
         "N_frames": total_frames,
         "runtime_seconds": time.perf_counter() - started,
         "peak_gpu_memory_bytes": peak_gpu_memory_bytes(),
+        "numerics": numerics_settings(config),
         "aggregate": {
             "psnr": _mean_std(all_psnr),
             "ssim": _mean_std(all_ssim),
@@ -347,6 +364,7 @@ def main() -> None:
         help="Task B baseline: SD inpainting only, no RAFT/ConvLSTM/transformer/reference selector.",
     )
     parser.add_argument("--output", default="", help="Output JSON path. Defaults next to the checkpoint.")
+    parser.add_argument("--preset", default="", help="Filled numerics YAML preset.")
     args = parser.parse_args()
 
     config = TRDNConfig(
@@ -357,6 +375,8 @@ def main() -> None:
         train_mode=args.train_mode,
         mask_mode=args.mask_mode,
     )
+    if args.preset:
+        apply_numerics_preset(config, args.preset)
     if args.dataset_root:
         config.override_dataset_root(args.dataset_root)
 

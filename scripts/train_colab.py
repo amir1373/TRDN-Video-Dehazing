@@ -7,6 +7,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import TRDNConfig
+from src.presets import apply_numerics_preset
 from src.train import train_trdn
 
 
@@ -28,6 +29,7 @@ def main():
     parser.add_argument("--mixed-precision", default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--keep-last-n-checkpoints", type=int, default=3)
     parser.add_argument("--run-name", default="")
+    parser.add_argument("--preset", default="", help="Filled numerics YAML preset.")
     args = parser.parse_args()
 
     config = TRDNConfig(
@@ -47,6 +49,8 @@ def main():
         keep_last_n_checkpoints=args.keep_last_n_checkpoints,
         run_name=args.run_name,
     )
+    if args.preset:
+        apply_numerics_preset(config, args.preset)
     if args.dataset_root:
         config.override_dataset_root(args.dataset_root)
     print(train_trdn(config))

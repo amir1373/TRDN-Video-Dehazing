@@ -62,7 +62,16 @@ def get_sample_batch(config: Any, device: str, split: str = "train", crop_size: 
 def run_temporal_debug(config: Any, batch: dict, device: str, use_raft: bool = False) -> dict:
     """Run the repository temporal stack for notebook visualization/debugging."""
     frames = batch["frames"].to(device)
-    raft_model = load_raft(device, config.freeze_raft) if use_raft and torch.cuda.is_available() else None
+    raft_model = (
+        load_raft(
+            device,
+            config.freeze_raft,
+            config.validate_raft_flow,
+            config.raft_max_flow_factor,
+        )
+        if use_raft and torch.cuda.is_available()
+        else None
+    )
     warped_refs, flows = compute_warped_references_batch(frames, raft_model)
     current = frames[:, -1]
     temporal_memory = TemporalMemoryModule(hidden_dim=64).to(device)

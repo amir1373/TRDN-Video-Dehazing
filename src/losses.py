@@ -17,12 +17,29 @@ class LossBundle(nn.Module):
             self.lpips_model = lpips.LPIPS(net="alex").to(device).eval()
             for param in self.lpips_model.parameters():
                 param.requires_grad_(False)
-        except Exception:
-            self.lpips_model = None
+        except Exception as exc:
+            raise RuntimeError(
+                "LPIPS initialization failed while w_lpips is part of the training objective. "
+                "Refusing to continue with a silently disabled perceptual loss."
+            ) from exc
+        self.lpips_startup_probe = self._assert_lpips_nonzero(device)
+
+    def _assert_lpips_nonzero(self, device: str) -> float:
+        first = torch.zeros(1, 3, 64, 64, device=device)
+        second = torch.ones(1, 3, 64, 64, device=device)
+        with torch.no_grad():
+            value = self.lpips_loss(first, second).float()
+        if not torch.isfinite(value):
+            raise RuntimeError("LPIPS startup probe returned a non-finite value.")
+        scalar = float(value.detach().cpu())
+        if scalar <= 0.0:
+            raise RuntimeError(
+                "LPIPS startup probe returned zero for deliberately different tensors. "
+                "Refusing to train with an ineffective perceptual loss."
+            )
+        return scalar
 
     def lpips_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if self.lpips_model is None:
-            return pred.new_tensor(0.0)
         pred = normalize_to_neg_one_to_one(pred.clamp(0, 1))
         target = normalize_to_neg_one_to_one(target.clamp(0, 1))
         return self.lpips_model(pred, target).mean()

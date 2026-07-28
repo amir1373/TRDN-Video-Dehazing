@@ -11,6 +11,8 @@ from src.config import TRDNConfig
 from src.provenance import (
     JsonlMetricLogger,
     checkpoint_metadata,
+    find_numerics_mismatches,
+    numerics_settings,
     prune_step_checkpoints,
     validate_checkpoint_modes,
 )
@@ -101,7 +103,30 @@ def test_checkpoint_metadata_records_reproducibility_fields(tmp_path: Path):
     assert metadata["seq_len"] == 7
     assert metadata["crop_size"] == 192
     assert metadata["loss_weights"]["flow"] == 0.125
+    assert metadata["numerics"] == numerics_settings(config)
     assert metadata["git_commit_sha"]
+
+
+def test_existing_run_with_different_numerics_is_reported(tmp_path: Path):
+    config = TRDNConfig(mixed_precision="bf16", batch_size=2)
+    manifest_path = tmp_path / "runs" / "older" / "run_manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    existing = numerics_settings(config)
+    existing["mixed_precision"] = "fp16"
+    existing["batch_size"] = 1
+    manifest_path.write_text(json.dumps({"numerics": existing}), encoding="utf-8")
+
+    mismatches = find_numerics_mismatches(tmp_path, config)
+
+    assert len(mismatches) == 1
+    assert mismatches[0]["differences"]["mixed_precision"] == {
+        "existing": "fp16",
+        "current": "bf16",
+    }
+    assert mismatches[0]["differences"]["batch_size"] == {
+        "existing": 1,
+        "current": 2,
+    }
 
 
 def test_checkpoint_retention_keeps_newest_steps_and_all_named_checkpoints(tmp_path: Path):
@@ -192,7 +217,11 @@ def test_lightweight_training_smoke_writes_manifest_and_metrics(tmp_path: Path, 
         device = torch.device("cpu")
 
         def __init__(self, **_kwargs):
-            pass
+            self.backward_calls = 0
+
+        @property
+        def optimizer_step_was_skipped(self):
+            return self.backward_calls == 2
 
         def init_trackers(self, *_args, **_kwargs):
             pass
@@ -206,8 +235,8 @@ def test_lightweight_training_smoke_writes_manifest_and_metrics(tmp_path: Path, 
         def autocast(self):
             return nullcontext()
 
-        @staticmethod
-        def backward(loss):
+        def backward(self, loss):
+            self.backward_calls += 1
             loss.backward()
 
         @staticmethod
@@ -261,6 +290,9 @@ def test_lightweight_training_smoke_writes_manifest_and_metrics(tmp_path: Path, 
 
     def tiny_loss(_accelerator, diffusion_arg, *_args, **_kwargs):
         base = diffusion_arg["unet"].weight.square().sum()
+        batch = _args[6]
+        if int(batch["index"].item()) == 1:
+            base = base * torch.tensor(float("nan"))
         parts = {
             "diffusion": base,
             "l1": base,
@@ -295,5 +327,10 @@ def test_lightweight_training_smoke_writes_manifest_and_metrics(tmp_path: Path, 
     assert manifest["status"] == "completed"
     assert manifest["dataset_sizes"]["train"]["num_clips"] == 4
     assert manifest["training"]["wall_clock_seconds"] >= 0.0
+    assert manifest["training"]["non_finite_loss_steps"] == 1
+    assert manifest["training"]["non_finite_loss_terms"] == 6
+    assert manifest["training"]["optimizer_steps_skipped"] == 1
     assert [row["event"] for row in rows].count("step") == 3
     assert [row["event"] for row in rows].count("epoch") == 1
+    assert [row["event"] for row in rows].count("nonfinite_loss") == 1
+    assert [row["event"] for row in rows].count("optimizer_step_skipped") == 1

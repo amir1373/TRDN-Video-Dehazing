@@ -1,0 +1,11 @@
+# Fill every TODO from scripts/benchmark.py output before the first A40 run.
+# This file is intentionally not a runnable preset until all values are set.
+preset_name: a40_locked
+precision: TODO
+allow_tf32: TODO
+cudnn_benchmark: TODO
+attention_backend: TODO
+batch_size: TODO
+gradient_checkpointing: TODO
+torch_compile: TODO
+channels_last: TODO

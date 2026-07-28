@@ -21,6 +21,8 @@ class TRDNConfig:
     seq_len: int = 10
     batch_size: int = 1
     num_workers: int = 2
+    persistent_workers: bool = False
+    prefetch_factor: int = 2
     mixed_precision: str = "fp16"
     seed: int = 1234
 
@@ -73,7 +75,13 @@ class TRDNConfig:
     lora_dropout: float = 0.0
     enable_unet_gradient_checkpointing: bool = True
     enable_xformers_if_available: bool = True
+    attention_backend: Literal["xformers", "sdpa"] = "xformers"
     enable_torch_compile: bool = False
+    allow_tf32: bool = False
+    cudnn_benchmark: bool = False
+    channels_last: bool = False
+    validate_raft_flow: bool = True
+    raft_max_flow_factor: float = 2.0
 
     learning_rate: float = 1e-5
     temporal_learning_rate: float = 1e-4

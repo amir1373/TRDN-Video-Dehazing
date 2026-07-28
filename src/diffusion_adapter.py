@@ -6,6 +6,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .assertions import assert_image, assert_latents, assert_mask, assert_temporal_memory
+from .runtime import apply_channels_last, configure_torch_backends
+
+
+def resolve_frozen_dtype(mixed_precision: str, device: str) -> torch.dtype:
+    if torch.device(device).type != "cuda":
+        return torch.float32
+    if mixed_precision == "fp16":
+        return torch.float16
+    if mixed_precision == "bf16":
+        return torch.bfloat16
+    return torch.float32
 
 
 def normalize_to_neg_one_to_one(x: torch.Tensor) -> torch.Tensor:
@@ -55,7 +66,8 @@ def load_diffusion_backbone(config: Any, device: str = "cuda") -> Dict[str, Any]
     from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler, UNet2DConditionModel
     from transformers import CLIPTextModel, CLIPTokenizer
 
-    frozen_dtype = torch.float16 if config.mixed_precision == "fp16" and torch.cuda.is_available() else torch.float32
+    configure_torch_backends(config)
+    frozen_dtype = resolve_frozen_dtype(config.mixed_precision, device)
     # Trainable parameters must remain FP32 when using AMP/GradScaler.
     # Loading the trainable UNet directly as FP16 causes:
     # "ValueError: Attempting to unscale FP16 gradients."
@@ -82,16 +94,26 @@ def load_diffusion_backbone(config: Any, device: str = "cuda") -> Dict[str, Any]
             param.data = param.data.float()
     if config.enable_unet_gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-    if config.enable_xformers_if_available:
+    attention_backend = config.attention_backend
+    if not config.enable_xformers_if_available and attention_backend == "xformers":
+        attention_backend = "sdpa"
+    if attention_backend == "xformers":
         try:
             unet.enable_xformers_memory_efficient_attention()
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError("xformers attention was requested but could not be enabled.") from exc
+    elif attention_backend == "sdpa":
+        if not hasattr(unet, "set_default_attn_processor"):
+            raise RuntimeError("PyTorch SDPA was requested but this U-Net cannot set its default attention processor.")
+        unet.set_default_attn_processor()
+    else:
+        raise ValueError(f"Unsupported attention_backend={attention_backend!r}")
+    apply_channels_last([unet, vae], config.channels_last)
     if config.enable_torch_compile and hasattr(torch, "compile"):
         try:
             unet = torch.compile(unet)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError("torch.compile was requested for the U-Net but compilation failed.") from exc
     return {
         "tokenizer": tokenizer,
         "text_encoder": text_encoder,
@@ -100,6 +122,8 @@ def load_diffusion_backbone(config: Any, device: str = "cuda") -> Dict[str, Any]
         "noise_scheduler": noise_scheduler,
         "inference_scheduler": inference_scheduler,
         "lora_report": lora_report,
+        "attention_backend": attention_backend,
+        "compile_enabled": bool(config.enable_torch_compile),
     }
 
 

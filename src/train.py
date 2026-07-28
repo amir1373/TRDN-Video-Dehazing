@@ -1,4 +1,5 @@
 import json
+import math
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -29,6 +30,7 @@ from .provenance import (
     JsonlMetricLogger,
     checkpoint_metadata,
     create_run_manifest,
+    find_numerics_mismatches,
     make_run_dir,
     mean_records,
     peak_gpu_memory_bytes,
@@ -77,6 +79,14 @@ def make_datasets(config: TRDNConfig) -> Tuple[REVIDESequenceDataset, REVIDESequ
 
 def make_dataloaders(config: TRDNConfig) -> Tuple[DataLoader, DataLoader]:
     train_dataset, val_dataset = make_datasets(config)
+    worker_options = (
+        {
+            "persistent_workers": config.persistent_workers,
+            "prefetch_factor": config.prefetch_factor,
+        }
+        if config.num_workers > 0
+        else {}
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -84,6 +94,7 @@ def make_dataloaders(config: TRDNConfig) -> Tuple[DataLoader, DataLoader]:
         num_workers=config.num_workers,
         pin_memory=True,
         drop_last=True,
+        **worker_options,
     )
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
     return train_loader, val_loader
@@ -156,6 +167,7 @@ def forward_window_prediction(
     target: torch.Tensor,
     seq_len: int,
     autocast: bool = True,
+    timing: Dict[str, float] | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Run the full temporal + diffusion stack for one [B,T,3,H,W] window.
 
@@ -168,7 +180,15 @@ def forward_window_prediction(
     current = frames[:, -1]
 
     with torch.no_grad():
+        if timing is not None and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            raft_started = time.perf_counter()
         warped_refs, flows = compute_warped_references_batch(frames, raft_model)
+        if timing is not None and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            timing["raft_seconds"] = timing.get("raft_seconds", 0.0) + (
+                time.perf_counter() - raft_started
+            )
     assert_warped_references(warped_refs, seq_len=seq_len)
 
     aligned_frames = torch.cat([warped_refs, current.unsqueeze(1)], dim=1)
@@ -225,6 +245,7 @@ def compute_training_loss(
     batch: Dict[str, Any],
     config: TRDNConfig,
     temporal_loss_enabled: bool = True,
+    timing: Dict[str, float] | None = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     frames = batch["frames"].to(accelerator.device, non_blocking=True)
     target = batch["target_frame"].to(accelerator.device, non_blocking=True)
@@ -244,6 +265,7 @@ def compute_training_loss(
         corrupted,
         target,
         seq_len=config.seq_len,
+        timing=timing,
     )
     pred_img = current_out["pred_img"]
     warped_refs = current_out["warped_refs"]
@@ -271,6 +293,7 @@ def compute_training_loss(
                 prev_corrupted,
                 prev_target,
                 seq_len=config.seq_len,
+                timing=timing,
             )
         temporal_loss = loss_bundle.predictive_temporal_consistency_loss(
             pred_img, prev_out["pred_img"], flows[:, -1]
@@ -330,20 +353,36 @@ def _step_metric_record(
     step: int,
     epoch: int,
 ) -> Dict[str, Any]:
+    def finite_scalar(value: torch.Tensor) -> float | None:
+        scalar = float(value.detach().cpu())
+        return scalar if math.isfinite(scalar) else None
+
     loss_names = ("diffusion", "l1", "lpips", "temporal", "flow", "reference")
     learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
     record: Dict[str, Any] = {
         "event": "step",
         "step": step,
         "epoch": epoch,
-        "total_loss": float(total_loss.detach().cpu()),
+        "total_loss": finite_scalar(total_loss),
         "lr": learning_rates[0],
         "learning_rates": learning_rates,
     }
     for name in loss_names:
         value = parts.get(name)
-        record[f"loss_{name}"] = float(value.detach().cpu()) if value is not None else None
+        record[f"loss_{name}"] = finite_scalar(value) if value is not None else None
     return record
+
+
+def nonfinite_loss_terms(
+    parts: Dict[str, torch.Tensor],
+    total_loss: torch.Tensor,
+) -> list[str]:
+    values = {**parts, "total": total_loss}
+    return [
+        name
+        for name, value in values.items()
+        if not bool(torch.isfinite(value.detach()).all().item())
+    ]
 
 
 def train_trdn(config: TRDNConfig) -> Dict[str, float]:
@@ -356,6 +395,13 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
     run_dir = make_run_dir(Path(paths["logs"]), config.run_name)
     manifest_path = run_dir / "run_manifest.json"
     metric_logger = JsonlMetricLogger(run_dir / "metrics.jsonl")
+    numerics_mismatches = find_numerics_mismatches(Path(paths["logs"]), config)
+    if numerics_mismatches:
+        print("=" * 88)
+        print("WARNING: NUMERICS SETTINGS DIFFER FROM AN EXISTING RUN")
+        print(json.dumps(numerics_mismatches, indent=2, sort_keys=True))
+        print("Ablation results are not directly comparable unless numerics match.")
+        print("=" * 88)
     started = time.perf_counter()
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -386,7 +432,16 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
     )
     train_loader, val_loader = make_dataloaders(config)
     test_dataset = make_test_dataset_for_manifest(config)
-    raft_model = load_raft(device, config.freeze_raft) if config.use_raft_alignment and torch.cuda.is_available() else None
+    raft_model = (
+        load_raft(
+            device,
+            config.freeze_raft,
+            config.validate_raft_flow,
+            config.raft_max_flow_factor,
+        )
+        if config.use_raft_alignment and torch.cuda.is_available()
+        else None
+    )
 
     modules = {
         "unet": diffusion["unet"],
@@ -407,6 +462,9 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
             modules,
             optimizer,
         )
+        if numerics_mismatches:
+            manifest["numerics_mismatch_warnings"] = numerics_mismatches
+            write_json(manifest_path, manifest)
         print("TRDN RUN MANIFEST")
         print(json.dumps(manifest, indent=2, sort_keys=True, default=str))
 
@@ -466,6 +524,9 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
         disable=not accelerator.is_main_process,
         desc="Training TRDN",
     )
+    non_finite_loss_steps = 0
+    non_finite_loss_terms_count = 0
+    optimizer_steps_skipped = 0
     for epoch_index in range(config.num_epochs):
         epoch = epoch_index + 1
         epoch_records = []
@@ -473,6 +534,9 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
         for batch in train_loader:
             if global_step >= target_train_steps:
                 break
+            attempted_step = global_step + 1
+            grad_norm = None
+            overflow_step_skipped = False
             with accelerator.accumulate(diffusion["unet"]):
                 total_loss, parts = compute_training_loss(
                     accelerator,
@@ -486,26 +550,65 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     batch,
                     config,
                 )
-                accelerator.backward(total_loss)
-                grad_norm = None
-                if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(
-                        list(diffusion["unet"].parameters())
-                        + list(temporal_memory.parameters())
-                        + ([] if temporal_transformer is None else list(temporal_transformer.parameters()))
-                        + list(reference_selector.parameters())
-                        + list(conditioning_adapter.parameters()),
-                        config.max_grad_norm,
+                bad_terms = nonfinite_loss_terms(parts, total_loss)
+                if bad_terms:
+                    optimizer.zero_grad(set_to_none=True)
+                else:
+                    accelerator.backward(total_loss)
+                    if accelerator.sync_gradients:
+                        grad_norm = accelerator.clip_grad_norm_(
+                            list(diffusion["unet"].parameters())
+                            + list(temporal_memory.parameters())
+                            + ([] if temporal_transformer is None else list(temporal_transformer.parameters()))
+                            + list(reference_selector.parameters())
+                            + list(conditioning_adapter.parameters()),
+                            config.max_grad_norm,
+                        )
+                    optimizer.step()
+                    overflow_step_skipped = bool(
+                        accelerator.sync_gradients
+                        and getattr(accelerator, "optimizer_step_was_skipped", False)
                     )
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
             progress.update(1)
             step_record = _step_metric_record(parts, total_loss, optimizer, global_step, epoch)
+            step_record["nonfinite_terms"] = bad_terms
+            step_record["optimizer_step_skipped"] = overflow_step_skipped
             epoch_records.append(step_record)
             if accelerator.is_main_process:
                 metric_logger.append(step_record)
+                if bad_terms:
+                    non_finite_loss_steps += 1
+                    non_finite_loss_terms_count += len(bad_terms)
+                    metric_logger.append(
+                        {
+                            "event": "nonfinite_loss",
+                            "step": attempted_step,
+                            "epoch": epoch,
+                            "terms": bad_terms,
+                        }
+                    )
+                    print(
+                        f"NON-FINITE LOSS: step={attempted_step} terms={','.join(bad_terms)}; "
+                        "optimizer update skipped."
+                    )
+                if overflow_step_skipped:
+                    optimizer_steps_skipped += 1
+                    metric_logger.append(
+                        {
+                            "event": "optimizer_step_skipped",
+                            "step": attempted_step,
+                            "epoch": epoch,
+                            "reason": "accelerate_gradient_scaler_overflow",
+                            "mixed_precision": config.mixed_precision,
+                        }
+                    )
+                    print(
+                        f"OPTIMIZER STEP SKIPPED: step={attempted_step} "
+                        "Accelerate reported gradient-scaler overflow."
+                    )
 
             if accelerator.is_main_process and global_step % config.log_every == 0:
                 tracker_logs = {
@@ -513,7 +616,10 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     for key, value in step_record.items()
                     if key.startswith("loss_") and value is not None
                 }
-                tracker_logs["train/total_loss"] = step_record["total_loss"]
+                if step_record["total_loss"] is not None:
+                    tracker_logs["train/total_loss"] = step_record["total_loss"]
+                tracker_logs["safety/non_finite_loss_steps"] = non_finite_loss_steps
+                tracker_logs["safety/optimizer_steps_skipped"] = optimizer_steps_skipped
                 if grad_norm is not None:
                     tracker_logs["train/grad_norm"] = float(
                         grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm
@@ -633,6 +739,9 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                 "training": {
                     "wall_clock_seconds": elapsed_seconds,
                     "peak_gpu_memory_bytes": peak_gpu_memory_bytes(),
+                    "non_finite_loss_steps": non_finite_loss_steps,
+                    "non_finite_loss_terms": non_finite_loss_terms_count,
+                    "optimizer_steps_skipped": optimizer_steps_skipped,
                     "result": result,
                 },
             },
