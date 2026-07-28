@@ -25,7 +25,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-root", default="/content/drive/MyDrive/TRDN_REVIDE")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--allow-mode-mismatch", action="store_true")
-    parser.add_argument("--max-batches", type=int, default=8)
+    parser.add_argument(
+        "--num-samples",
+        "--max-batches",
+        dest="num_samples",
+        type=int,
+        default=32,
+        help="Exact validation sample cap; --max-batches is a deprecated alias.",
+    )
+    parser.add_argument("--num-steps", type=int, default=30)
+    parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument(
         "--text-prompt",
@@ -42,6 +51,9 @@ def main():
         allow_mode_mismatch=args.allow_mode_mismatch,
         guidance_scale=args.guidance_scale,
         text_prompt=args.text_prompt,
+        validation_num_samples=args.num_samples,
+        validation_num_inference_steps=args.num_steps,
+        validation_seed=args.seed,
     )
     if args.dataset_root:
         config.override_dataset_root(args.dataset_root)
@@ -101,7 +113,9 @@ def main():
         LossBundle(device),
         device,
         raft_model=raft_model,
-        max_batches=args.max_batches,
+        num_samples=config.validation_num_samples,
+        num_steps=config.validation_num_inference_steps,
+        seed=config.validation_seed,
         text_prompt=config.text_prompt,
         guidance_scale=config.guidance_scale,
     )

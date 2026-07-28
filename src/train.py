@@ -49,7 +49,11 @@ from .validate import validate_trdn
 from .warp import warp_with_flow
 
 
-def make_datasets(config: TRDNConfig) -> Tuple[REVIDESequenceDataset, REVIDESequenceDataset]:
+def make_datasets(
+    config: TRDNConfig,
+    *,
+    validate_structure: bool = True,
+) -> Tuple[REVIDESequenceDataset, REVIDESequenceDataset]:
     train_dataset = REVIDESequenceDataset(
         config.root_for_split(config.train_split),
         split=config.train_split,
@@ -77,8 +81,9 @@ def make_datasets(config: TRDNConfig) -> Tuple[REVIDESequenceDataset, REVIDESequ
         split_seed=config.split_seed,
         include_prev_frame=False,  # validation only ever runs infer_dehazed_batch, which doesn't use it
     )
-    train_dataset.assert_valid_structure("train")
-    val_dataset.assert_valid_structure("validation")
+    if validate_structure:
+        train_dataset.assert_valid_structure("train")
+        val_dataset.assert_valid_structure("validation")
     return train_dataset, val_dataset
 
 
@@ -390,13 +395,21 @@ def save_checkpoint(
     run_manifest_path: Path,
     name: str | None = None,
     ema: EMAState | None = None,
+    validation_state: Dict[str, Any] | None = None,
 ) -> None:
     out_dir = checkpoint_dir / (name or f"step_{step:06d}")
     accelerator.save_state(str(out_dir))
     if accelerator.is_main_process:
         write_json(
             out_dir / "metadata.json",
-            checkpoint_metadata(config, step, best_psnr, best_ssim, run_manifest_path),
+            checkpoint_metadata(
+                config,
+                step,
+                best_psnr,
+                best_ssim,
+                run_manifest_path,
+                validation_state,
+            ),
         )
         if ema is not None:
             ema.save_weights(out_dir / "ema_weights.pt")
@@ -447,7 +460,19 @@ def nonfinite_loss_terms(
     ]
 
 
-def train_trdn(config: TRDNConfig) -> Dict[str, float]:
+def train_trdn(config: TRDNConfig) -> Dict[str, Any]:
+    if config.validation_num_samples <= 0:
+        raise ValueError("validation_num_samples must be positive.")
+    if config.validation_num_inference_steps <= 0:
+        raise ValueError("validation_num_inference_steps must be positive.")
+    if config.checkpoint_selection_metric not in {"psnr", "ssim"}:
+        raise ValueError(
+            "checkpoint_selection_metric must be either 'psnr' or 'ssim'."
+        )
+    if config.enable_early_stopping and config.early_stopping_patience <= 0:
+        raise ValueError(
+            "early_stopping_patience must be positive when early stopping is enabled."
+        )
     seed_mismatches = find_seed_mismatches(Path(config.paths()["logs"]), config)
     print(f"Resolved training seed: {config.seed}")
     if seed_mismatches:
@@ -532,6 +557,9 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
     if ema is not None:
         accelerator.register_for_checkpointing(ema)
     base_learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
+    prior_manifest: Dict[str, Any] = {}
+    if manifest_path.exists():
+        prior_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if accelerator.is_main_process and not (
         resumed_manifest_path is not None and resumed_manifest_path.is_file()
     ):
@@ -552,7 +580,6 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
         print("TRDN RUN MANIFEST")
         print(json.dumps(manifest, indent=2, sort_keys=True, default=str))
     elif accelerator.is_main_process:
-        prior_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         resumes = list(prior_manifest.get("resumes", []))
         resumes.append(
             {
@@ -612,6 +639,26 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
     global_step = int(resume_metadata.get("step", 0))
     best_psnr = float(resume_metadata.get("best_psnr", -1.0))
     best_ssim = float(resume_metadata.get("best_ssim", -1.0))
+    resumed_selection = resume_metadata.get("checkpoint_selection", {})
+    early_stopping_bad_validation_count = int(
+        resumed_selection.get("early_stopping_bad_validation_count", 0)
+    )
+    validation_state: Dict[str, Any] = {
+        "num_samples": int(resumed_selection.get("validation_num_samples", 0)),
+        "num_inference_steps": int(
+            resumed_selection.get(
+                "validation_num_inference_steps",
+                config.validation_num_inference_steps,
+            )
+        ),
+        "seed": int(
+            resumed_selection.get("validation_seed", config.validation_seed)
+        ),
+        "step": resumed_selection.get("validation_step"),
+        "early_stopping_bad_validation_count": early_stopping_bad_validation_count,
+    }
+    validation_history = list(prior_manifest.get("validation_passes", []))
+    stopped_early = False
     if config.resume_from_checkpoint:
         accelerator.load_state(config.resume_from_checkpoint)
 
@@ -770,6 +817,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                 accelerator.log(tracker_logs, step=global_step)
 
             if global_step % config.validate_every == 0:
+                validation_started = time.perf_counter()
                 metrics = validate_trdn(
                     val_loader,
                     diffusion,
@@ -780,10 +828,23 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     loss_bundle,
                     str(accelerator.device),
                     raft_model=raft_model,
-                    max_batches=config.validation_max_batches,
+                    num_samples=config.validation_num_samples,
                     num_steps=config.validation_num_inference_steps,
+                    seed=config.validation_seed,
                     text_prompt=config.text_prompt,
                     guidance_scale=config.guidance_scale,
+                )
+                validation_wall_clock_seconds = float(
+                    metrics.get(
+                        "wall_clock_seconds",
+                        time.perf_counter() - validation_started,
+                    )
+                )
+                validation_samples = int(
+                    metrics.get(
+                        "num_samples",
+                        min(config.validation_num_samples, len(val_loader.dataset)),
+                    )
                 )
                 epoch_validation = {
                     key: float(value)
@@ -794,6 +855,54 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     {f"val/{key}": value for key, value in epoch_validation.items()},
                     step=global_step,
                 )
+                selected_metric = config.checkpoint_selection_metric
+                selected_best_before = (
+                    best_psnr if selected_metric == "psnr" else best_ssim
+                )
+                selected_value = epoch_validation[selected_metric]
+                selected_improved = selected_value > selected_best_before
+                psnr_improved = epoch_validation["psnr"] > best_psnr
+                ssim_improved = epoch_validation["ssim"] > best_ssim
+                if psnr_improved:
+                    best_psnr = epoch_validation["psnr"]
+                if ssim_improved:
+                    best_ssim = epoch_validation["ssim"]
+                if selected_improved:
+                    early_stopping_bad_validation_count = 0
+                else:
+                    early_stopping_bad_validation_count += 1
+                stopped_early = (
+                    config.enable_early_stopping
+                    and early_stopping_bad_validation_count
+                    >= config.early_stopping_patience
+                )
+                validation_state = {
+                    "step": global_step,
+                    "num_samples": validation_samples,
+                    "num_inference_steps": int(
+                        metrics.get(
+                            "num_inference_steps",
+                            config.validation_num_inference_steps,
+                        )
+                    ),
+                    "seed": int(metrics.get("seed", config.validation_seed)),
+                    "wall_clock_seconds": validation_wall_clock_seconds,
+                    "unet_forward_passes": int(
+                        metrics.get(
+                            "unet_forward_passes",
+                            validation_samples
+                            * config.validation_num_inference_steps
+                            * (2 if config.guidance_scale != 1.0 else 1),
+                        )
+                    ),
+                    "selection_metric": selected_metric,
+                    "selection_value": selected_value,
+                    "selection_improved": selected_improved,
+                    "early_stopping_bad_validation_count": (
+                        early_stopping_bad_validation_count
+                    ),
+                }
+                validation_history.append(dict(validation_state))
                 if accelerator.is_main_process:
                     metric_logger.append(
                         {
@@ -801,10 +910,45 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                             "step": global_step,
                             "epoch": epoch,
                             **{f"val_{key}": value for key, value in epoch_validation.items()},
+                            "selection_metric": selected_metric,
+                            "selection_value": selected_value,
+                            "selection_improved": selected_improved,
                         }
                     )
-                if epoch_validation["psnr"] > best_psnr:
-                    best_psnr = epoch_validation["psnr"]
+                    update_manifest(
+                        manifest_path,
+                        {
+                            "checkpoint_selection": {
+                                "metric": selected_metric,
+                                "checkpoint_name": f"best_{selected_metric}",
+                                "current_value": (
+                                    best_psnr
+                                    if selected_metric == "psnr"
+                                    else best_ssim
+                                ),
+                                "validation_num_samples_configured": (
+                                    config.validation_num_samples
+                                ),
+                                "validation_num_samples_actual": validation_samples,
+                                "validation_num_inference_steps": (
+                                    config.validation_num_inference_steps
+                                ),
+                                "validation_seed": config.validation_seed,
+                                "early_stopping_enabled": (
+                                    config.enable_early_stopping
+                                ),
+                                "early_stopping_patience": (
+                                    config.early_stopping_patience
+                                ),
+                                "early_stopping_bad_validation_count": (
+                                    early_stopping_bad_validation_count
+                                ),
+                                "stopped_early": stopped_early,
+                            },
+                            "validation_passes": validation_history,
+                        },
+                    )
+                if psnr_improved:
                     save_checkpoint(
                         accelerator,
                         Path(paths["checkpoints"]),
@@ -815,9 +959,9 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                         manifest_path,
                         "best_psnr",
                         ema,
+                        validation_state,
                     )
-                if epoch_validation["ssim"] > best_ssim:
-                    best_ssim = epoch_validation["ssim"]
+                if ssim_improved:
                     save_checkpoint(
                         accelerator,
                         Path(paths["checkpoints"]),
@@ -828,6 +972,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                         manifest_path,
                         "best_ssim",
                         ema,
+                        validation_state,
                     )
 
             if global_step % config.checkpoint_every == 0:
@@ -840,7 +985,16 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     config,
                     manifest_path,
                     ema=ema,
+                    validation_state=validation_state,
                 )
+            if stopped_early:
+                progress.write(
+                    "EARLY STOPPING: "
+                    f"metric={config.checkpoint_selection_metric} "
+                    f"patience={config.early_stopping_patience} "
+                    f"step={global_step}"
+                )
+                break
 
         if accelerator.is_main_process and epoch_records:
             aggregate_keys = [
@@ -862,7 +1016,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     **{f"val_{key}": value for key, value in epoch_validation.items()},
                 }
             )
-        if global_step >= target_train_steps:
+        if stopped_early or global_step >= target_train_steps:
             break
 
     save_checkpoint(
@@ -875,9 +1029,20 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
         manifest_path,
         "last",
         ema,
+        validation_state,
     )
     elapsed_seconds = time.perf_counter() - started
-    result = {"step": float(global_step), "best_psnr": best_psnr, "best_ssim": best_ssim}
+    selected_best = (
+        best_psnr if config.checkpoint_selection_metric == "psnr" else best_ssim
+    )
+    result = {
+        "step": float(global_step),
+        "best_psnr": best_psnr,
+        "best_ssim": best_ssim,
+        "selection_metric": config.checkpoint_selection_metric,
+        "selection_value": selected_best if selected_best >= 0 else None,
+        "stopped_early": stopped_early,
+    }
     if accelerator.is_main_process:
         update_manifest(
             manifest_path,
@@ -890,6 +1055,18 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     "non_finite_loss_steps": non_finite_loss_steps,
                     "non_finite_loss_terms": non_finite_loss_terms_count,
                     "optimizer_steps_skipped": optimizer_steps_skipped,
+                    "checkpoint_selection_metric": (
+                        config.checkpoint_selection_metric
+                    ),
+                    "checkpoint_selection_value": (
+                        selected_best if selected_best >= 0 else None
+                    ),
+                    "validation_num_samples": validation_state["num_samples"],
+                    "validation_num_inference_steps": validation_state[
+                        "num_inference_steps"
+                    ],
+                    "validation_seed": validation_state["seed"],
+                    "stopped_early": stopped_early,
                     "ema": (
                         {
                             "enabled": True,

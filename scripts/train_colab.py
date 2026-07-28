@@ -41,6 +41,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-warmup-steps", type=int, default=0)
     parser.add_argument("--enable-linear-lr-scaling", action="store_true")
     parser.add_argument("--lr-reference-batch-size", type=int, default=1)
+    parser.add_argument("--validation-num-samples", type=int, default=32)
+    parser.add_argument("--validation-num-steps", type=int, default=30)
+    parser.add_argument("--validation-seed", type=int, default=1234)
+    parser.add_argument(
+        "--checkpoint-selection-metric",
+        choices=["psnr", "ssim"],
+        default="psnr",
+    )
+    parser.add_argument("--enable-early-stopping", action="store_true")
+    parser.add_argument("--early-stopping-patience", type=int, default=5)
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument(
         "--text-prompt",
@@ -75,6 +85,12 @@ def main():
         lr_warmup_steps=args.lr_warmup_steps,
         enable_linear_lr_scaling=args.enable_linear_lr_scaling,
         lr_reference_batch_size=args.lr_reference_batch_size,
+        validation_num_samples=args.validation_num_samples,
+        validation_num_inference_steps=args.validation_num_steps,
+        validation_seed=args.validation_seed,
+        checkpoint_selection_metric=args.checkpoint_selection_metric,
+        enable_early_stopping=args.enable_early_stopping,
+        early_stopping_patience=args.early_stopping_patience,
         guidance_scale=args.guidance_scale,
         text_prompt=args.text_prompt,
     )

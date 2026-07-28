@@ -335,7 +335,7 @@ def _predict_selected(
                 runtime["reference_selector"],
                 runtime["conditioning_adapter"],
                 device,
-                raft_model=runtime["raft_model"],
+                raft_model=runtime["model_raft"],
                 num_steps=int(report["num_inference_steps"]),
                 seed=seed,
                 sample_ids=sample_id,

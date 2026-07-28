@@ -5,7 +5,7 @@ import pytest
 from scripts.preflight import assert_checkpoint_storage_fits
 from scripts.smoke_test import make_fake_revide_tree
 from src.config import TRDNConfig
-from src.dataset import REVIDESequenceDataset
+from src.dataset import REVIDESequenceDataset, frame_pairing_report, list_images
 from src.provenance import (
     ensure_project_config_compatible,
     find_seed_mismatches,
@@ -35,6 +35,51 @@ def test_dataset_count_mismatch_has_specific_early_error(tmp_path: Path):
     )
 
     with pytest.raises(RuntimeError, match=r"train_0: hazy=4 clean=3"):
+        dataset.assert_valid_structure("train")
+
+
+def test_frame_pairing_uses_natural_sort_and_known_modality_stems(tmp_path: Path):
+    hazy = tmp_path / "hazy"
+    clean = tmp_path / "clean"
+    hazy.mkdir()
+    clean.mkdir()
+    for index in (10, 2, 1):
+        (hazy / f"hazy_frame_{index}.png").touch()
+        (clean / f"clean_frame_{index}.png").touch()
+
+    hazy_files = list_images(hazy, (".png",))
+    clean_files = list_images(clean, (".png",))
+    report = frame_pairing_report(hazy_files, clean_files)
+
+    assert [path.stem for path in hazy_files] == [
+        "hazy_frame_1",
+        "hazy_frame_2",
+        "hazy_frame_10",
+    ]
+    assert [path.stem for path in clean_files] == [
+        "clean_frame_1",
+        "clean_frame_2",
+        "clean_frame_10",
+    ]
+    assert report["consistent"] is True
+    assert report["inference_used"] is True
+    assert len(report["sample_inferred_pairs"]) == 3
+
+
+def test_frame_pairing_mismatch_fails_with_inferred_sample(tmp_path: Path):
+    make_fake_revide_tree(tmp_path)
+    hazy = tmp_path / "Train" / "train_0" / "hazy"
+    (hazy / "0002.png").rename(hazy / "0099.png")
+    dataset = REVIDESequenceDataset(
+        str(tmp_path / "Train"),
+        split=None,
+        seq_len=2,
+        crop_size=16,
+        synthetic_if_empty=False,
+        train_mode="dehaze",
+    )
+
+    with pytest.raises(RuntimeError, match=r"Inferred sample pairs.*0099\.png"):
         dataset.assert_valid_structure("train")
 
 

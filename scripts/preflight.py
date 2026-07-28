@@ -305,6 +305,12 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         lr_warmup_steps=args.lr_warmup_steps,
         enable_linear_lr_scaling=args.enable_linear_lr_scaling,
         lr_reference_batch_size=args.lr_reference_batch_size,
+        validation_num_samples=args.validation_num_samples,
+        validation_num_inference_steps=args.validation_num_steps,
+        validation_seed=args.validation_seed,
+        checkpoint_selection_metric=args.checkpoint_selection_metric,
+        enable_early_stopping=args.enable_early_stopping,
+        early_stopping_patience=args.early_stopping_patience,
         guidance_scale=args.guidance_scale,
         text_prompt=args.text_prompt,
     )
@@ -347,8 +353,13 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         print(json.dumps(numerics_mismatches, indent=2, sort_keys=True))
         print("Ablation results are not comparable until these settings match.")
 
-    train_dataset, val_dataset = make_datasets(config)
+    train_dataset, val_dataset = make_datasets(config, validate_structure=False)
     test_dataset = make_test_dataset_for_manifest(config)
+    dataset_layouts = {
+        "train": train_dataset.layout_inventory(),
+        "val": val_dataset.layout_inventory(),
+        "test": test_dataset.layout_inventory(),
+    }
     for split, dataset in (
         ("train", train_dataset),
         ("val", val_dataset),
@@ -508,6 +519,7 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         "resolved_modes": {"train_mode": config.train_mode, "mask_mode": resolved_mask},
         "config": config.to_dict(),
         "dataset_sizes": sizes,
+        "dataset_layouts": dataset_layouts,
         "sequence_overlaps": overlaps,
         "numerics_mismatch_warnings": numerics_mismatches,
         "seed_mismatch_warnings": seed_mismatches,
@@ -565,6 +577,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-warmup-steps", type=int, default=0)
     parser.add_argument("--enable-linear-lr-scaling", action="store_true")
     parser.add_argument("--lr-reference-batch-size", type=int, default=1)
+    parser.add_argument("--validation-num-samples", type=int, default=32)
+    parser.add_argument("--validation-num-steps", type=int, default=30)
+    parser.add_argument("--validation-seed", type=int, default=1234)
+    parser.add_argument(
+        "--checkpoint-selection-metric",
+        choices=["psnr", "ssim"],
+        default="psnr",
+    )
+    parser.add_argument("--enable-early-stopping", action="store_true")
+    parser.add_argument("--early-stopping-patience", type=int, default=5)
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument(
         "--text-prompt",

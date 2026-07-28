@@ -1,3 +1,4 @@
+import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -230,12 +231,17 @@ def validate_trdn(
     loss_bundle: torch.nn.Module,
     device: str,
     raft_model: torch.nn.Module | None = None,
-    max_batches: int = 8,
-    num_steps: int = 10,
+    num_samples: int = 32,
+    num_steps: int = 30,
     seed: Optional[int] = DEFAULT_EVAL_SEED,
     text_prompt: str = "a clear clean dehazed video frame",
     guidance_scale: float = 1.0,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
+    if num_samples <= 0:
+        raise ValueError(f"Validation num_samples must be positive, got {num_samples}.")
+    if num_steps <= 0:
+        raise ValueError(f"Validation num_steps must be positive, got {num_steps}.")
+    started = time.perf_counter()
     diffusion["unet"].eval()
     temporal_memory.eval()
     if temporal_transformer is not None:
@@ -244,22 +250,30 @@ def validate_trdn(
     conditioning_adapter.eval()
     psnrs, ssims, lpips_values = [], [], []
     first_output = None
-    validation_total = min(len(val_loader), max_batches)
+    validation_total = min(len(val_loader.dataset), num_samples)
     progress = ProgressReporter(
         validation_total,
         "Validation",
         leave=False,
         position=1,
     )
+    evaluated_samples = 0
     for batch_idx, batch in enumerate(val_loader):
-        if batch_idx >= max_batches:
+        if evaluated_samples >= num_samples:
             break
-        frames = batch["frames"].to(device)
-        target = batch["target_frame"].to(device)
-        mask = batch["mask"].to(device)
-        corrupted = batch["corrupted_frame"].to(device)
-        sequence_name = batch.get("sequence_name", [f"batch{batch_idx}"])
-        sample_ids = [f"{sequence_name[0] if isinstance(sequence_name, list) else sequence_name}:{batch_idx}"]
+        remaining = num_samples - evaluated_samples
+        take = min(int(batch["frames"].shape[0]), remaining)
+        frames = batch["frames"][:take].to(device)
+        target = batch["target_frame"][:take].to(device)
+        mask = batch["mask"][:take].to(device)
+        corrupted = batch["corrupted_frame"][:take].to(device)
+        sequence_names = batch.get("sequence_name", [f"batch{batch_idx}"] * take)
+        if isinstance(sequence_names, str):
+            sequence_names = [sequence_names]
+        sample_ids = [
+            f"{sequence_names[index]}:{evaluated_samples + index}"
+            for index in range(take)
+        ]
         output = infer_dehazed_batch(
             frames,
             mask,
@@ -279,13 +293,24 @@ def validate_trdn(
             guidance_scale=guidance_scale,
         )
         pred = output["prediction"]
-        psnrs.append(psnr_metric(pred[0], target[0]))
-        ssims.append(ssim_metric(pred[0], target[0]))
-        lpips_values.append(float(loss_bundle.lpips_loss(pred, target).detach().cpu()))
+        for sample_index in range(take):
+            sample_prediction = pred[sample_index : sample_index + 1]
+            sample_target = target[sample_index : sample_index + 1]
+            psnrs.append(psnr_metric(sample_prediction[0], sample_target[0]))
+            ssims.append(ssim_metric(sample_prediction[0], sample_target[0]))
+            lpips_values.append(
+                float(
+                    loss_bundle.lpips_loss(
+                        sample_prediction,
+                        sample_target,
+                    ).detach().cpu()
+                )
+            )
+        evaluated_samples += take
         if first_output is None:
             first_output = output
         progress.set_postfix({"mean_psnr": f"{np.mean(psnrs):.3f}"})
-        progress.update(1)
+        progress.update(take)
     progress.close()
 
     diffusion["unet"].train()
@@ -298,5 +323,12 @@ def validate_trdn(
         "psnr": float(np.mean(psnrs)) if psnrs else 0.0,
         "ssim": float(np.mean(ssims)) if ssims else 0.0,
         "lpips": float(np.mean(lpips_values)) if lpips_values else 0.0,
+        "num_samples": evaluated_samples,
+        "num_inference_steps": num_steps,
+        "seed": seed,
+        "wall_clock_seconds": time.perf_counter() - started,
+        "unet_forward_passes": (
+            evaluated_samples * num_steps * (2 if guidance_scale != 1.0 else 1)
+        ),
         "first_output": first_output,
     }

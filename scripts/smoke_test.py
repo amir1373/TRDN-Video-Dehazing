@@ -101,7 +101,17 @@ def tiny_training_loss(
 
 
 def tiny_validation(*_args, **_kwargs):
-    return {"psnr": 20.0, "ssim": 0.8, "lpips": 0.1, "first_output": None}
+    return {
+        "psnr": 20.0,
+        "ssim": 0.8,
+        "lpips": 0.1,
+        "num_samples": 2,
+        "num_inference_steps": 1,
+        "seed": 1234,
+        "wall_clock_seconds": 0.0,
+        "unet_forward_passes": 2,
+        "first_output": None,
+    }
 
 
 def tiny_eval_runtime(_config, _checkpoint, _device, *, diffusion_only=False, use_ema=False):
@@ -111,7 +121,7 @@ def tiny_eval_runtime(_config, _checkpoint, _device, *, diffusion_only=False, us
         "temporal_transformer": None if diffusion_only else TinyModule(),
         "reference_selector": None if diffusion_only else TinyModule(),
         "conditioning_adapter": None if diffusion_only else TinyModule(),
-        "raft_model": None,
+        "model_raft": None,
         "ema": None,
     }
 
@@ -233,6 +243,10 @@ def run_smoke(work_root: Path) -> dict:
                 "1",
                 "--timed-steps",
                 "1",
+                "--validation-num-samples",
+                "2",
+                "--validation-num-steps",
+                "1",
                 "--enable-ema",
             ]
         )
@@ -254,6 +268,8 @@ def run_smoke(work_root: Path) -> dict:
             checkpoint_every=1,
             log_every=1,
             num_inference_steps=1,
+            validation_num_samples=2,
+            validation_num_inference_steps=1,
             enable_ema=True,
             run_name="smoke",
         )
@@ -346,6 +362,24 @@ def run_smoke(work_root: Path) -> dict:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest["resumes"][-1]["from_step"] != 2:
         raise AssertionError("Resume manifest did not record the source step.")
+    if manifest["checkpoint_selection"]["metric"] != "psnr":
+        raise AssertionError("Smoke manifest did not record the selection metric.")
+    if len(manifest["validation_passes"]) != 4:
+        raise AssertionError("Validation pass history was not preserved across resume.")
+    for validation_pass in manifest["validation_passes"]:
+        if validation_pass["num_samples"] != 2:
+            raise AssertionError("Validation manifest recorded the wrong sample count.")
+        if validation_pass["num_inference_steps"] != 1:
+            raise AssertionError("Validation manifest recorded the wrong inference steps.")
+        if "wall_clock_seconds" not in validation_pass:
+            raise AssertionError("Validation manifest omitted measured pass cost.")
+    checkpoint_metadata = json.loads(
+        (checkpoint / "metadata.json").read_text(encoding="utf-8")
+    )
+    if checkpoint_metadata["checkpoint_selection"]["value"] != 20.0:
+        raise AssertionError("Checkpoint metadata omitted the selected metric value.")
+    if checkpoint_metadata["checkpoint_selection"]["validation_num_samples"] != 2:
+        raise AssertionError("Checkpoint metadata omitted validation sample count.")
     full_report = json.loads(eval_paths[0].read_text(encoding="utf-8"))
     if full_report["clips_total_found"] != 2:
         raise AssertionError("Smoke evaluation did not discover both test sequences.")
@@ -353,6 +387,11 @@ def run_smoke(work_root: Path) -> dict:
         raise AssertionError("Smoke evaluation clip accounting is incorrect.")
     if full_report["skipped_clips"][0]["reason"] != "too_short_for_seq_len":
         raise AssertionError("Too-short sequence was not reported with the expected reason.")
+    diffusion_report = json.loads(eval_paths[1].read_text(encoding="utf-8"))
+    if diffusion_report["aggregate"]["temporal_consistency_l1"]["mean"] is None:
+        raise AssertionError(
+            "Diffusion-only baseline did not report the evaluator-owned temporal metric."
+        )
 
     return {
         "status": "PASS",

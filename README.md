@@ -303,9 +303,15 @@ python scripts/validate_colab.py \
 
 Validation reports PSNR, SSIM, and LPIPS on the **validation split** (a
 held-out subset of training sequences -- see "Evaluation protocol" below), and
-uses seeded DDIM inference (eta=0) by default so results are reproducible run
-to run. It does not fake or include training results, and it never reads test
-data.
+uses a fixed seed and DDIM eta=0 so repeated validation of the same checkpoint
+is deterministic. Checkpoint selection defaults to PSNR over up to 32
+validation samples at 30 inference steps. Configure these independently with
+`--validation-num-samples`, `--validation-num-steps`, `--validation-seed`, and
+`--checkpoint-selection-metric`. Each pass records its actual sample count,
+step count, U-Net forward-pass count, and measured wall time in the run
+manifest. Early stopping is absent by default; opt in with
+`--enable-early-stopping --early-stopping-patience N`. Validation never reads
+test data.
 
 ## Evaluation Protocol
 
@@ -335,12 +341,20 @@ data.
   consistency error (RAFT-warp prediction t-1 into t, mask invalid/occluded
   pixels via forward-backward flow consistency, report mean L1 on the valid
   pixels) -- not a naive inter-frame difference, since a naive diff conflates
-  real motion with actual flicker.
+  real motion with actual flicker. The evaluator loads a dedicated metric-only
+  RAFT for every variant, including diffusion-only. This is separate from the
+  model RAFT used for temporal reference alignment; diffusion-only never
+  invokes the model RAFT or any temporal model component.
 - **Determinism**: inference uses DDIM with eta=0 and a per-sample,
   per-frame-index deterministic noise generator (`src/seeding.py`), so two
   runs with the same seed produce identical metrics. Random per-run noise
   previously caused a 1.67 dB spread between two runs of the same
   configuration; this is now fixed by default.
+- **Frame pairing**: preflight natural-sorts filenames (`frame_2` precedes
+  `frame_10`) and requires positional pairs to have either identical stems or
+  stems equal after removing documented modality tokens such as `hazy`,
+  `clean`, `gt`, `input`, and `target`. Inferred differing-stem pairs are
+  printed for inspection; inconsistent ordering fails preflight.
 
 ### Running the full test-set evaluation
 
