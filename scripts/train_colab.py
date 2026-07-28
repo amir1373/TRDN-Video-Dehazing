@@ -11,7 +11,7 @@ from src.presets import apply_numerics_preset
 from src.train import train_trdn
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train TRDN on REVIDE from a Colab runtime.")
     parser.add_argument("--dataset-root", default="", help="Optional override for config.train_root/test_root parent.")
     parser.add_argument("--project-root", default="/content/drive/MyDrive/TRDN_REVIDE")
@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--resume-from-checkpoint", default="")
     parser.add_argument("--allow-mode-mismatch", action="store_true")
+    parser.add_argument("--allow-output-collision", action="store_true")
     parser.add_argument("--train-mode", default="dehaze", choices=["dehaze", "reconstruct_synthetic"])
     parser.add_argument("--mask-mode", default="auto")
     parser.add_argument("--seed", type=int, default=1234)
@@ -30,7 +31,26 @@ def main():
     parser.add_argument("--keep-last-n-checkpoints", type=int, default=3)
     parser.add_argument("--run-name", default="")
     parser.add_argument("--preset", default="", help="Filled numerics YAML preset.")
-    args = parser.parse_args()
+    parser.add_argument("--enable-ema", action="store_true")
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=["constant", "warmup_cosine"],
+        default="constant",
+    )
+    parser.add_argument("--lr-warmup-steps", type=int, default=0)
+    parser.add_argument("--enable-linear-lr-scaling", action="store_true")
+    parser.add_argument("--lr-reference-batch-size", type=int, default=1)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--text-prompt",
+        default="a clear clean dehazed video frame",
+    )
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     config = TRDNConfig(
         project_root=args.project_root,
@@ -38,6 +58,7 @@ def main():
         num_epochs=args.num_epochs,
         resume_from_checkpoint=args.resume_from_checkpoint,
         allow_mode_mismatch=args.allow_mode_mismatch,
+        allow_output_collision=args.allow_output_collision,
         train_mode=args.train_mode,
         mask_mode=args.mask_mode,
         seed=args.seed,
@@ -48,6 +69,14 @@ def main():
         mixed_precision=args.mixed_precision,
         keep_last_n_checkpoints=args.keep_last_n_checkpoints,
         run_name=args.run_name,
+        enable_ema=args.enable_ema,
+        ema_decay=args.ema_decay,
+        lr_schedule=args.lr_schedule,
+        lr_warmup_steps=args.lr_warmup_steps,
+        enable_linear_lr_scaling=args.enable_linear_lr_scaling,
+        lr_reference_batch_size=args.lr_reference_batch_size,
+        guidance_scale=args.guidance_scale,
+        text_prompt=args.text_prompt,
     )
     if args.preset:
         apply_numerics_preset(config, args.preset)

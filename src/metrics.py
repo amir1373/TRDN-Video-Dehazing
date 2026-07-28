@@ -18,15 +18,13 @@ def _to_uint8_hwc(x: torch.Tensor) -> np.ndarray:
 
 
 def ssim_metric(pred: torch.Tensor, target: torch.Tensor) -> float:
-    try:
-        from skimage.metrics import structural_similarity
+    from skimage.metrics import structural_similarity
 
-        return float(structural_similarity(_to_uint8_hwc(pred), _to_uint8_hwc(target), channel_axis=2, data_range=255))
-    except Exception:
-        x = pred.detach().float().clamp(0, 1)
-        y = target.detach().float().clamp(0, 1)
-        c1, c2 = 0.01**2, 0.03**2
-        mux, muy = x.mean(), y.mean()
-        vx, vy = x.var(), y.var()
-        cov = ((x - mux) * (y - muy)).mean()
-        return float(((2 * mux * muy + c1) * (2 * cov + c2)) / ((mux**2 + muy**2 + c1) * (vx + vy + c2)))
+    return float(
+        structural_similarity(
+            _to_uint8_hwc(pred),
+            _to_uint8_hwc(target),
+            channel_axis=2,
+            data_range=255,
+        )
+    )

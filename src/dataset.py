@@ -200,12 +200,131 @@ class REVIDESequenceDataset(Dataset):
             self.sequences = [sequence for sequence in self.sequences if sequence["name"] in keep]
 
         self.index: List[Tuple[int, int]] = []
+        self.skipped_sequences: List[Dict[str, Any]] = []
         min_window = seq_len + 1 if self.needs_prev_frame else seq_len
         for seq_idx, sequence in enumerate(self.sequences):
-            count = min(len(sequence["hazy_files"]), len(sequence["clean_files"]))
+            hazy_count = len(sequence["hazy_files"])
+            clean_count = len(sequence["clean_files"])
+            if hazy_count != clean_count:
+                self.skipped_sequences.append(
+                    {
+                        "sequence_name": sequence["name"],
+                        "reason": "hazy_clean_count_mismatch",
+                        "hazy_frames": hazy_count,
+                        "clean_frames": clean_count,
+                    }
+                )
+                continue
+            count = hazy_count
+            if count < min_window:
+                self.skipped_sequences.append(
+                    {
+                        "sequence_name": sequence["name"],
+                        "reason": "too_short_for_seq_len",
+                        "hazy_frames": hazy_count,
+                        "clean_frames": clean_count,
+                        "required_frames": min_window,
+                    }
+                )
+                continue
             for end_idx in range(min_window - 1, count):
                 self.index.append((seq_idx, end_idx))
         self.synthetic_len = 8 if not self.index and synthetic_if_empty else 0
+
+    def layout_inventory(self) -> Dict[str, Any]:
+        skipped = {
+            item["sequence_name"]: item
+            for item in self.skipped_sequences
+        }
+        sequences = []
+        for sequence in self.sequences:
+            status = skipped.get(sequence["name"])
+            sequences.append(
+                {
+                    "sequence_name": sequence["name"],
+                    "hazy_dir": str(sequence["hazy_dir"]),
+                    "clean_dir": str(sequence["clean_dir"]),
+                    "hazy_frames": len(sequence["hazy_files"]),
+                    "clean_frames": len(sequence["clean_files"]),
+                    "pairing": "sorted_position",
+                    "status": "skipped" if status else "eligible",
+                    "reason": status.get("reason") if status else None,
+                }
+            )
+        return {
+            "root": str(self.root.resolve()),
+            "sequence_count": len(self.sequences),
+            "eligible_sequence_count": len(self.sequences) - len(self.skipped_sequences),
+            "skipped_sequence_count": len(self.skipped_sequences),
+            "sequences": sequences,
+        }
+
+    def assert_valid_structure(self, split: str) -> None:
+        if not self.sequences:
+            raise RuntimeError(
+                f"{split} dataset structure mismatch at {self.root}: "
+                "no directories containing both hazy and clean image folders were found."
+            )
+        count_mismatches = [
+            item
+            for item in self.skipped_sequences
+            if item["reason"] == "hazy_clean_count_mismatch"
+        ]
+        if count_mismatches:
+            details = "; ".join(
+                f"{item['sequence_name']}: hazy={item['hazy_frames']} clean={item['clean_frames']}"
+                for item in count_mismatches
+            )
+            raise RuntimeError(
+                f"{split} dataset structure mismatch: hazy/clean frame counts differ: {details}"
+            )
+        if not self.index:
+            shortest = "; ".join(
+                f"{item['sequence_name']}: found={item['hazy_frames']} "
+                f"required={item.get('required_frames', self.seq_len)}"
+                for item in self.skipped_sequences
+            )
+            raise RuntimeError(
+                f"{split} dataset has no sequence long enough for seq_len={self.seq_len}. "
+                f"{shortest or 'No paired frames were found.'}"
+            )
+        for sequence in self.sequences:
+            if any(
+                item["sequence_name"] == sequence["name"]
+                for item in self.skipped_sequences
+            ):
+                continue
+            expected_size = None
+            for hazy_path, clean_path in zip(
+                sequence["hazy_files"],
+                sequence["clean_files"],
+            ):
+                try:
+                    with Image.open(hazy_path) as hazy_image:
+                        hazy_size = hazy_image.size
+                        hazy_image.verify()
+                    with Image.open(clean_path) as clean_image:
+                        clean_size = clean_image.size
+                        clean_image.verify()
+                except (OSError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"{split} dataset decode failure in sequence "
+                        f"{sequence['name']}: {type(exc).__name__}: {exc}"
+                    ) from exc
+                if hazy_size != clean_size:
+                    raise RuntimeError(
+                        f"{split} dataset spatial mismatch in sequence "
+                        f"{sequence['name']}: {hazy_path.name}={hazy_size} "
+                        f"{clean_path.name}={clean_size}"
+                    )
+                if expected_size is None:
+                    expected_size = hazy_size
+                elif hazy_size != expected_size:
+                    raise RuntimeError(
+                        f"{split} dataset frame-size mismatch within sequence "
+                        f"{sequence['name']}: expected={expected_size} "
+                        f"found={hazy_size} at {hazy_path.name}"
+                    )
 
     def _resolve_mask_mode(self) -> str:
         if self.mask_mode != "auto":

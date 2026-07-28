@@ -9,7 +9,6 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 
 from .assertions import (
     assert_frames,
@@ -24,13 +23,16 @@ from .config import TRDNConfig
 from .convlstm import TemporalMemoryModule
 from .dataset import REVIDESequenceDataset
 from .diffusion_adapter import estimate_x0_from_epsilon, get_text_embeddings, prepare_inpainting_inputs, decode_latents_to_images, encode_images_to_latents
+from .ema import EMAState
 from .flow import compute_warped_references_batch, load_raft
 from .losses import LossBundle, weighted_total_loss
 from .provenance import (
     JsonlMetricLogger,
     checkpoint_metadata,
+    ensure_project_config_compatible,
     create_run_manifest,
     find_numerics_mismatches,
+    find_seed_mismatches,
     make_run_dir,
     mean_records,
     peak_gpu_memory_bytes,
@@ -39,6 +41,7 @@ from .provenance import (
     validate_checkpoint_modes,
     write_json,
 )
+from .progress import ProgressReporter
 from .reference_selector import ReferenceSelectionModule
 from .diffusion_adapter import TemporalConditioningAdapter, load_diffusion_backbone
 from .temporal_transformer import TemporalRetrievalTransformer
@@ -54,7 +57,7 @@ def make_datasets(config: TRDNConfig) -> Tuple[REVIDESequenceDataset, REVIDESequ
         crop_size=config.crop_size,
         random_crop=True,
         extensions=config.image_extensions,
-        synthetic_if_empty=True,
+        synthetic_if_empty=False,
         train_mode=config.train_mode,
         mask_mode=config.mask_mode,
         val_fraction=config.val_fraction,
@@ -67,13 +70,15 @@ def make_datasets(config: TRDNConfig) -> Tuple[REVIDESequenceDataset, REVIDESequ
         crop_size=config.crop_size,
         random_crop=False,
         extensions=config.image_extensions,
-        synthetic_if_empty=True,
+        synthetic_if_empty=False,
         train_mode=config.train_mode,
         mask_mode=config.mask_mode,
         val_fraction=config.val_fraction,
         split_seed=config.split_seed,
         include_prev_frame=False,  # validation only ever runs infer_dehazed_batch, which doesn't use it
     )
+    train_dataset.assert_valid_structure("train")
+    val_dataset.assert_valid_structure("validation")
     return train_dataset, val_dataset
 
 
@@ -92,11 +97,17 @@ def make_dataloaders(config: TRDNConfig) -> Tuple[DataLoader, DataLoader]:
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
         drop_last=True,
         **worker_options,
     )
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
     return train_loader, val_loader
 
 
@@ -142,15 +153,55 @@ def build_temporal_modules(
 
 
 def build_optimizer(config: TRDNConfig, unet, temporal_memory, temporal_transformer, reference_selector, conditioning_adapter):
+    learning_rate, temporal_learning_rate = effective_learning_rates(config)
     groups = []
     if config.train_unet:
-        groups.append({"params": [p for p in unet.parameters() if p.requires_grad], "lr": config.learning_rate})
+        groups.append({"params": [p for p in unet.parameters() if p.requires_grad], "lr": learning_rate})
     if config.train_temporal_modules:
         temporal_params = list(temporal_memory.parameters()) + list(reference_selector.parameters()) + list(conditioning_adapter.parameters())
         if temporal_transformer is not None:
             temporal_params += list(temporal_transformer.parameters())
-        groups.append({"params": temporal_params, "lr": config.temporal_learning_rate})
+        groups.append({"params": temporal_params, "lr": temporal_learning_rate})
     return torch.optim.AdamW(groups, weight_decay=config.weight_decay)
+
+
+def effective_learning_rates(config: TRDNConfig) -> tuple[float, float]:
+    if not config.enable_linear_lr_scaling:
+        return config.learning_rate, config.temporal_learning_rate
+    if config.lr_reference_batch_size <= 0:
+        raise ValueError("lr_reference_batch_size must be positive.")
+    scale = (
+        config.batch_size
+        * config.gradient_accumulation_steps
+        / config.lr_reference_batch_size
+    )
+    return config.learning_rate * scale, config.temporal_learning_rate * scale
+
+
+def apply_optional_lr_schedule(
+    config: TRDNConfig,
+    optimizer: torch.optim.Optimizer,
+    base_learning_rates: list[float],
+    step: int,
+    total_steps: int,
+) -> None:
+    if config.lr_schedule == "constant":
+        return
+    if config.lr_schedule != "warmup_cosine":
+        raise ValueError(f"Unsupported lr_schedule={config.lr_schedule!r}")
+    if config.lr_warmup_steps < 0:
+        raise ValueError("lr_warmup_steps must be non-negative.")
+    if step <= config.lr_warmup_steps and config.lr_warmup_steps > 0:
+        factor = step / config.lr_warmup_steps
+    else:
+        decay_steps = max(total_steps - config.lr_warmup_steps, 1)
+        progress = min(
+            max((step - config.lr_warmup_steps) / decay_steps, 0.0),
+            1.0,
+        )
+        factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+    for group, base_lr in zip(optimizer.param_groups, base_learning_rates):
+        group["lr"] = base_lr * factor
 
 
 def forward_window_prediction(
@@ -168,6 +219,7 @@ def forward_window_prediction(
     seq_len: int,
     autocast: bool = True,
     timing: Dict[str, float] | None = None,
+    text_prompt: str = "a clear clean dehazed video frame",
 ) -> Dict[str, torch.Tensor]:
     """Run the full temporal + diffusion stack for one [B,T,3,H,W] window.
 
@@ -204,7 +256,12 @@ def forward_window_prediction(
         ref = reference_selector(warped_refs, memory, prior_logits=prior_logits)
         assert_reference_weights(ref["weights"], seq_len=seq_len)
         cond_tokens = conditioning_adapter(memory, ref["reference_feature"])
-        text = get_text_embeddings(diffusion["tokenizer"], diffusion["text_encoder"], frames.shape[0]).to(cond_tokens.dtype)
+        text = get_text_embeddings(
+            diffusion["tokenizer"],
+            diffusion["text_encoder"],
+            frames.shape[0],
+            prompt=text_prompt,
+        ).to(cond_tokens.dtype)
         encoder_hidden_states = torch.cat([text, cond_tokens], dim=1)
 
         with torch.no_grad():
@@ -266,6 +323,7 @@ def compute_training_loss(
         target,
         seq_len=config.seq_len,
         timing=timing,
+        text_prompt=config.text_prompt,
     )
     pred_img = current_out["pred_img"]
     warped_refs = current_out["warped_refs"]
@@ -294,6 +352,7 @@ def compute_training_loss(
                 prev_target,
                 seq_len=config.seq_len,
                 timing=timing,
+                text_prompt=config.text_prompt,
             )
         temporal_loss = loss_bundle.predictive_temporal_consistency_loss(
             pred_img, prev_out["pred_img"], flows[:, -1]
@@ -330,6 +389,7 @@ def save_checkpoint(
     config: TRDNConfig,
     run_manifest_path: Path,
     name: str | None = None,
+    ema: EMAState | None = None,
 ) -> None:
     out_dir = checkpoint_dir / (name or f"step_{step:06d}")
     accelerator.save_state(str(out_dir))
@@ -338,6 +398,8 @@ def save_checkpoint(
             out_dir / "metadata.json",
             checkpoint_metadata(config, step, best_psnr, best_ssim, run_manifest_path),
         )
+        if ema is not None:
+            ema.save_weights(out_dir / "ema_weights.pt")
         if name is None:
             prune_step_checkpoints(
                 checkpoint_dir,
@@ -386,13 +448,29 @@ def nonfinite_loss_terms(
 
 
 def train_trdn(config: TRDNConfig) -> Dict[str, float]:
+    seed_mismatches = find_seed_mismatches(Path(config.paths()["logs"]), config)
+    print(f"Resolved training seed: {config.seed}")
+    if seed_mismatches:
+        print("=" * 88)
+        print("WARNING: SEED DIFFERS FROM A SIBLING RUN")
+        print(json.dumps(seed_mismatches, indent=2, sort_keys=True))
+        print("=" * 88)
+    ensure_project_config_compatible(config)
     paths = config.ensure_dirs()
     resume_metadata: Dict[str, Any] = {}
     if config.resume_from_checkpoint:
         # Validate before model construction and, critically, before weights load.
         resume_metadata = validate_checkpoint_modes(config.resume_from_checkpoint, config)
 
-    run_dir = make_run_dir(Path(paths["logs"]), config.run_name)
+    resumed_manifest_path = (
+        Path(str(resume_metadata.get("run_manifest_path", "")))
+        if resume_metadata.get("run_manifest_path")
+        else None
+    )
+    if resumed_manifest_path is not None and resumed_manifest_path.is_file():
+        run_dir = resumed_manifest_path.parent
+    else:
+        run_dir = make_run_dir(Path(paths["logs"]), config.run_name)
     manifest_path = run_dir / "run_manifest.json"
     metric_logger = JsonlMetricLogger(run_dir / "metrics.jsonl")
     numerics_mismatches = find_numerics_mismatches(Path(paths["logs"]), config)
@@ -450,7 +528,13 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
         "reference_selector": reference_selector,
         "conditioning_adapter": conditioning_adapter,
     }
-    if accelerator.is_main_process:
+    ema = EMAState(modules, config.ema_decay) if config.enable_ema else None
+    if ema is not None:
+        accelerator.register_for_checkpointing(ema)
+    base_learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
+    if accelerator.is_main_process and not (
+        resumed_manifest_path is not None and resumed_manifest_path.is_file()
+    ):
         manifest = create_run_manifest(
             manifest_path,
             config,
@@ -467,6 +551,24 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
             write_json(manifest_path, manifest)
         print("TRDN RUN MANIFEST")
         print(json.dumps(manifest, indent=2, sort_keys=True, default=str))
+    elif accelerator.is_main_process:
+        prior_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        resumes = list(prior_manifest.get("resumes", []))
+        resumes.append(
+            {
+                "checkpoint": str(Path(config.resume_from_checkpoint).resolve()),
+                "from_step": int(resume_metadata.get("step", 0)),
+                "resumed_at_unix": time.time(),
+            }
+        )
+        update_manifest(
+            manifest_path,
+            {
+                "status": "running",
+                "resumes": resumes,
+                "seed_mismatch_warnings": seed_mismatches,
+            },
+        )
 
     if temporal_transformer is not None:
         (
@@ -518,23 +620,36 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
         if config.max_train_steps and config.max_train_steps > 0
         else config.num_epochs * len(train_loader)
     )
-    progress = tqdm(
+    progress = ProgressReporter(
         total=target_train_steps,
         initial=global_step,
-        disable=not accelerator.is_main_process,
-        desc="Training TRDN",
+        desc=f"Training TRDN (epoch 1/{config.num_epochs})",
+        leave=True,
+        position=0,
+        enabled=accelerator.is_main_process,
     )
-    non_finite_loss_steps = 0
-    non_finite_loss_terms_count = 0
-    optimizer_steps_skipped = 0
+    prior_training = {}
+    if manifest_path.exists():
+        prior_training = json.loads(manifest_path.read_text(encoding="utf-8")).get("training", {})
+    non_finite_loss_steps = int(prior_training.get("non_finite_loss_steps", 0))
+    non_finite_loss_terms_count = int(prior_training.get("non_finite_loss_terms", 0))
+    optimizer_steps_skipped = int(prior_training.get("optimizer_steps_skipped", 0))
     for epoch_index in range(config.num_epochs):
         epoch = epoch_index + 1
+        progress.set_description(f"Training TRDN (epoch {epoch}/{config.num_epochs})")
         epoch_records = []
         epoch_validation: Dict[str, float] = {}
         for batch in train_loader:
             if global_step >= target_train_steps:
                 break
             attempted_step = global_step + 1
+            apply_optional_lr_schedule(
+                config,
+                optimizer,
+                base_learning_rates,
+                attempted_step,
+                target_train_steps,
+            )
             grad_norm = None
             overflow_step_skipped = False
             with accelerator.accumulate(diffusion["unet"]):
@@ -569,13 +684,41 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                         accelerator.sync_gradients
                         and getattr(accelerator, "optimizer_step_was_skipped", False)
                     )
+                    if (
+                        ema is not None
+                        and accelerator.sync_gradients
+                        and not overflow_step_skipped
+                    ):
+                        ema.update(
+                            {
+                                "unet": accelerator.unwrap_model(diffusion["unet"]),
+                                "temporal_memory": accelerator.unwrap_model(temporal_memory),
+                                "temporal_transformer": (
+                                    accelerator.unwrap_model(temporal_transformer)
+                                    if temporal_transformer is not None
+                                    else None
+                                ),
+                                "reference_selector": accelerator.unwrap_model(reference_selector),
+                                "conditioning_adapter": accelerator.unwrap_model(conditioning_adapter),
+                            }
+                        )
                     optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
-            progress.update(1)
             step_record = _step_metric_record(parts, total_loss, optimizer, global_step, epoch)
             step_record["nonfinite_terms"] = bad_terms
             step_record["optimizer_step_skipped"] = overflow_step_skipped
+            progress.set_postfix(
+                {
+                    "loss": (
+                        f"{step_record['total_loss']:.5f}"
+                        if step_record["total_loss"] is not None
+                        else "nonfinite"
+                    ),
+                    "lr": f"{step_record['lr']:.3e}",
+                }
+            )
+            progress.update(1)
             epoch_records.append(step_record)
             if accelerator.is_main_process:
                 metric_logger.append(step_record)
@@ -590,7 +733,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                             "terms": bad_terms,
                         }
                     )
-                    print(
+                    progress.write(
                         f"NON-FINITE LOSS: step={attempted_step} terms={','.join(bad_terms)}; "
                         "optimizer update skipped."
                     )
@@ -605,7 +748,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                             "mixed_precision": config.mixed_precision,
                         }
                     )
-                    print(
+                    progress.write(
                         f"OPTIMIZER STEP SKIPPED: step={attempted_step} "
                         "Accelerate reported gradient-scaler overflow."
                     )
@@ -625,7 +768,6 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                         grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm
                     )
                 accelerator.log(tracker_logs, step=global_step)
-                progress.set_postfix({"loss": step_record["total_loss"]})
 
             if global_step % config.validate_every == 0:
                 metrics = validate_trdn(
@@ -638,8 +780,10 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     loss_bundle,
                     str(accelerator.device),
                     raft_model=raft_model,
-                    max_batches=4,
-                    num_steps=min(10, config.num_inference_steps),
+                    max_batches=config.validation_max_batches,
+                    num_steps=config.validation_num_inference_steps,
+                    text_prompt=config.text_prompt,
+                    guidance_scale=config.guidance_scale,
                 )
                 epoch_validation = {
                     key: float(value)
@@ -670,6 +814,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                         config,
                         manifest_path,
                         "best_psnr",
+                        ema,
                     )
                 if epoch_validation["ssim"] > best_ssim:
                     best_ssim = epoch_validation["ssim"]
@@ -682,6 +827,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                         config,
                         manifest_path,
                         "best_ssim",
+                        ema,
                     )
 
             if global_step % config.checkpoint_every == 0:
@@ -693,6 +839,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     best_ssim,
                     config,
                     manifest_path,
+                    ema=ema,
                 )
 
         if accelerator.is_main_process and epoch_records:
@@ -727,6 +874,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
         config,
         manifest_path,
         "last",
+        ema,
     )
     elapsed_seconds = time.perf_counter() - started
     result = {"step": float(global_step), "best_psnr": best_psnr, "best_ssim": best_ssim}
@@ -742,6 +890,15 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     "non_finite_loss_steps": non_finite_loss_steps,
                     "non_finite_loss_terms": non_finite_loss_terms_count,
                     "optimizer_steps_skipped": optimizer_steps_skipped,
+                    "ema": (
+                        {
+                            "enabled": True,
+                            "decay": ema.decay,
+                            "num_updates": ema.num_updates,
+                        }
+                        if ema is not None
+                        else {"enabled": False}
+                    ),
                     "result": result,
                 },
             },

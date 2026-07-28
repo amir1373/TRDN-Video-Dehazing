@@ -90,10 +90,20 @@ class TRDNConfig:
     num_epochs: int = 20
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
+    lr_schedule: Literal["constant", "warmup_cosine"] = "constant"
+    lr_warmup_steps: int = 0
+    enable_linear_lr_scaling: bool = False
+    lr_reference_batch_size: int = 1
     log_every: int = 10
     validate_every: int = 500
     checkpoint_every: int = 250
     num_inference_steps: int = 30
+    validation_num_inference_steps: int = 10
+    validation_max_batches: int = 4
+    guidance_scale: float = 1.0
+    text_prompt: str = "a clear clean dehazed video frame"
+    enable_ema: bool = False
+    ema_decay: float = 0.9999
 
     w_diffusion: float = 1.0
     w_l1: float = 0.25
@@ -107,6 +117,7 @@ class TRDNConfig:
 
     resume_from_checkpoint: str = ""
     allow_mode_mismatch: bool = False
+    allow_output_collision: bool = False
     keep_last_n_checkpoints: int = 3
     always_keep_best: bool = True
     run_name: str = ""

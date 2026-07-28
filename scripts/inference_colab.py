@@ -10,15 +10,18 @@ from src.config import TRDNConfig
 from src.inference import run_inference_on_index
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run TRDN inference on one REVIDE sequence.")
     parser.add_argument("--dataset-root", default="", help="Optional override for config train/test roots.")
     parser.add_argument("--project-root", default="/content/drive/MyDrive/TRDN_REVIDE")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--allow-mode-mismatch", action="store_true")
     parser.add_argument("--index", type=int, default=0)
-    args = parser.parse_args()
+    return parser
 
+
+def main():
+    args = build_parser().parse_args()
     config = TRDNConfig(
         project_root=args.project_root,
         allow_mode_mismatch=args.allow_mode_mismatch,
