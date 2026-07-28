@@ -78,6 +78,28 @@ def numerics_settings(config: TRDNConfig) -> Dict[str, Any]:
     return {name: getattr(config, name) for name in NUMERICS_FIELDS}
 
 
+def model_variant_settings(config: TRDNConfig) -> Dict[str, Any]:
+    diffusion_only = config.model_variant == "diffusion_only"
+    return {
+        "name": config.model_variant,
+        "components": {
+            "unet": True,
+            "raft_alignment": config.use_raft_alignment and not diffusion_only,
+            "convlstm": not diffusion_only,
+            "temporal_transformer": config.use_temporal_transformer and not diffusion_only,
+            "reference_selector": not diffusion_only,
+            "conditioning_adapter": not diffusion_only,
+        },
+        "conditioning": "text_only" if diffusion_only else "text_plus_16_temporal_tokens",
+        "active_loss_terms": (
+            ["diffusion", "l1", "lpips"]
+            if diffusion_only
+            else ["diffusion", "l1", "lpips", "temporal", "flow"]
+            + (["reference"] if config.w_reference != 0.0 else [])
+        ),
+    }
+
+
 def comparable_run_config(config: TRDNConfig | Mapping[str, Any]) -> Dict[str, Any]:
     values = config.to_dict() if isinstance(config, TRDNConfig) else dict(config)
     return {
@@ -177,6 +199,7 @@ def checkpoint_metadata(
         "crop_size": int(config.crop_size),
         "loss_weights": loss_weights(config),
         "numerics": numerics_settings(config),
+        "model_variant": model_variant_settings(config),
         "config_fingerprint": config_fingerprint(config),
         "quality_settings": {
             "text_prompt": config.text_prompt,
@@ -271,6 +294,9 @@ def validate_checkpoint_modes(
 
     saved_train_mode = metadata.get("train_mode")
     saved_mask_mode = metadata.get("mask_mode")
+    saved_variant = metadata.get("model_variant")
+    if isinstance(saved_variant, dict):
+        saved_variant = saved_variant.get("name")
     current_mask_mode = effective_mask_mode(config.train_mode, config.mask_mode)
     missing = [
         name
@@ -282,6 +308,10 @@ def validate_checkpoint_modes(
         mismatches.append(f"train_mode checkpoint={saved_train_mode!r} current={config.train_mode!r}")
     if saved_mask_mode is not None and saved_mask_mode != current_mask_mode:
         mismatches.append(f"mask_mode checkpoint={saved_mask_mode!r} current={current_mask_mode!r}")
+    if saved_variant is not None and saved_variant != config.model_variant:
+        mismatches.append(
+            f"model_variant checkpoint={saved_variant!r} current={config.model_variant!r}"
+        )
 
     if (missing or mismatches) and not allow:
         details = []
@@ -319,7 +349,12 @@ def make_run_dir(logs_root: Path, run_name: str = "") -> Path:
     runs_root = logs_root / "runs"
     run_dir = runs_root / name
     suffix = 1
-    while run_dir.exists() and any(run_dir.iterdir()):
+    def contains_training_artifacts(path: Path) -> bool:
+        return path.exists() and any(
+            child.name != ".runpod_job" for child in path.iterdir()
+        )
+
+    while contains_training_artifacts(run_dir):
         run_dir = runs_root / f"{name}_{suffix:02d}"
         suffix += 1
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -398,6 +433,7 @@ def create_run_manifest(
         "trainable_parameters": trainable_parameter_counts(modules, optimizer),
         "environment": runtime_environment(config.mixed_precision),
         "numerics": numerics_settings(config),
+        "model_variant": model_variant_settings(config),
         "checkpoint_selection": {
             "metric": config.checkpoint_selection_metric,
             "checkpoint_name": f"best_{config.checkpoint_selection_metric}",

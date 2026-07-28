@@ -2,6 +2,8 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Literal, Tuple
 
+MODEL_VARIANTS = ("full", "no_raft", "no_transformer", "diffusion_only")
+
 
 @dataclass
 class TRDNConfig:
@@ -37,6 +39,9 @@ class TRDNConfig:
     #   evaluation. See src/dataset.py for the loud runtime warning this mode
     #   triggers.
     train_mode: Literal["dehaze", "reconstruct_synthetic"] = "dehaze"
+    model_variant: Literal[
+        "full", "no_raft", "no_transformer", "diffusion_only"
+    ] = "full"
 
     # "full": all-ones mask (full-frame restoration). The only mode that is
     #   semantically meaningful for real dehazing, since haze is global.
@@ -147,6 +152,15 @@ class TRDNConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def apply_model_variant(self) -> None:
+        if self.model_variant not in MODEL_VARIANTS:
+            raise ValueError(
+                f"model_variant must be one of {MODEL_VARIANTS}, got {self.model_variant!r}"
+            )
+        self.use_raft_alignment = self.model_variant in {"full", "no_transformer"}
+        self.use_temporal_transformer = self.model_variant in {"full", "no_raft"}
+        self.train_temporal_modules = self.model_variant != "diffusion_only"
 
     def to_tracker_dict(self) -> dict:
         """Return TensorBoard/Accelerate-safe hparams.

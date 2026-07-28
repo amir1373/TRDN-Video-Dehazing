@@ -94,9 +94,11 @@ def weighted_total_loss(config: Any, parts: dict) -> torch.Tensor:
         config.w_diffusion * parts["diffusion"]
         + config.w_l1 * parts["l1"]
         + config.w_lpips * parts["lpips"]
-        + config.w_temporal * parts["temporal"]
-        + config.w_flow * parts["flow"]
     )
+    if "temporal" in parts:
+        total = total + config.w_temporal * parts["temporal"]
+    if "flow" in parts:
+        total = total + config.w_flow * parts["flow"]
     if "reference" in parts:
         total = total + config.w_reference * parts["reference"]
     return total

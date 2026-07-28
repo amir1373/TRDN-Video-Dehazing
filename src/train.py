@@ -66,6 +66,8 @@ def make_datasets(
         mask_mode=config.mask_mode,
         val_fraction=config.val_fraction,
         split_seed=config.split_seed,
+        include_prev_frame=config.model_variant != "diffusion_only",
+        include_reference_frames=config.model_variant != "diffusion_only",
     )
     val_dataset = REVIDESequenceDataset(
         config.root_for_split(config.val_split),
@@ -80,6 +82,7 @@ def make_datasets(
         val_fraction=config.val_fraction,
         split_seed=config.split_seed,
         include_prev_frame=False,  # validation only ever runs infer_dehazed_batch, which doesn't use it
+        include_reference_frames=config.model_variant != "diffusion_only",
     )
     if validate_structure:
         train_dataset.assert_valid_structure("train")
@@ -133,12 +136,20 @@ def make_test_dataset_for_manifest(config: TRDNConfig) -> REVIDESequenceDataset:
         train_mode=config.train_mode,
         mask_mode=config.mask_mode,
         include_prev_frame=False,
+        include_reference_frames=config.model_variant != "diffusion_only",
     )
 
 
 def build_temporal_modules(
     config: TRDNConfig, cross_attention_dim: int, device: str
-) -> Tuple[torch.nn.Module, torch.nn.Module | None, torch.nn.Module, torch.nn.Module]:
+) -> Tuple[
+    torch.nn.Module | None,
+    torch.nn.Module | None,
+    torch.nn.Module | None,
+    torch.nn.Module | None,
+]:
+    if config.model_variant == "diffusion_only":
+        return None, None, None, None
     temporal_memory = TemporalMemoryModule(hidden_dim=64).to(device)
     temporal_transformer = (
         TemporalRetrievalTransformer(
@@ -163,11 +174,67 @@ def build_optimizer(config: TRDNConfig, unet, temporal_memory, temporal_transfor
     if config.train_unet:
         groups.append({"params": [p for p in unet.parameters() if p.requires_grad], "lr": learning_rate})
     if config.train_temporal_modules:
+        if temporal_memory is None or reference_selector is None or conditioning_adapter is None:
+            raise RuntimeError("Temporal training was enabled without temporal modules.")
         temporal_params = list(temporal_memory.parameters()) + list(reference_selector.parameters()) + list(conditioning_adapter.parameters())
         if temporal_transformer is not None:
             temporal_params += list(temporal_transformer.parameters())
         groups.append({"params": temporal_params, "lr": temporal_learning_rate})
     return torch.optim.AdamW(groups, weight_decay=config.weight_decay)
+
+
+def forward_diffusion_only_prediction(
+    accelerator: Accelerator,
+    diffusion: Dict[str, Any],
+    mask: torch.Tensor,
+    corrupted: torch.Tensor,
+    target: torch.Tensor,
+    text_prompt: str,
+) -> Dict[str, torch.Tensor]:
+    """Train the inpainting U-Net on the current frame with text conditioning only."""
+    assert_mask(mask, target)
+    with accelerator.autocast():
+        text = get_text_embeddings(
+            diffusion["tokenizer"],
+            diffusion["text_encoder"],
+            target.shape[0],
+            prompt=text_prompt,
+        )
+        with torch.no_grad():
+            latents = encode_images_to_latents(diffusion["vae"], target)
+        assert_latents(latents, target)
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(
+            0,
+            diffusion["noise_scheduler"].config.num_train_timesteps,
+            (latents.shape[0],),
+            device=latents.device,
+        ).long()
+        noisy_latents = diffusion["noise_scheduler"].add_noise(
+            latents,
+            noise,
+            timesteps,
+        )
+        model_input = prepare_inpainting_inputs(
+            diffusion["vae"],
+            noisy_latents,
+            mask,
+            corrupted,
+        )
+        noise_pred = diffusion["unet"](
+            model_input,
+            timesteps,
+            encoder_hidden_states=text,
+        ).sample
+        diffusion_loss = F.mse_loss(noise_pred.float(), noise.float())
+        pred_x0 = estimate_x0_from_epsilon(
+            diffusion["noise_scheduler"],
+            noisy_latents,
+            timesteps,
+            noise_pred,
+        )
+        pred_img = decode_latents_to_images(diffusion["vae"], pred_x0)
+    return {"pred_img": pred_img, "diffusion_loss": diffusion_loss}
 
 
 def effective_learning_rates(config: TRDNConfig) -> tuple[float, float]:
@@ -298,10 +365,10 @@ def forward_window_prediction(
 def compute_training_loss(
     accelerator: Accelerator,
     diffusion: Dict[str, Any],
-    temporal_memory: torch.nn.Module,
+    temporal_memory: torch.nn.Module | None,
     temporal_transformer: torch.nn.Module | None,
-    reference_selector: torch.nn.Module,
-    conditioning_adapter: torch.nn.Module,
+    reference_selector: torch.nn.Module | None,
+    conditioning_adapter: torch.nn.Module | None,
     raft_model: torch.nn.Module | None,
     loss_bundle: LossBundle,
     batch: Dict[str, Any],
@@ -314,6 +381,26 @@ def compute_training_loss(
     mask = batch["mask"].to(accelerator.device, non_blocking=True)
     corrupted = batch["corrupted_frame"].to(accelerator.device, non_blocking=True)
 
+    if config.model_variant == "diffusion_only":
+        current_out = forward_diffusion_only_prediction(
+            accelerator,
+            diffusion,
+            mask,
+            corrupted,
+            target,
+            config.text_prompt,
+        )
+        pred_img = current_out["pred_img"]
+        with accelerator.autocast():
+            parts = {
+                "diffusion": current_out["diffusion_loss"],
+                "l1": F.l1_loss(pred_img, target),
+                "lpips": loss_bundle.lpips_loss(pred_img, target),
+            }
+            return weighted_total_loss(config, parts), parts
+
+    if temporal_memory is None or reference_selector is None or conditioning_adapter is None:
+        raise RuntimeError("Temporal model variant is missing required modules.")
     current_out = forward_window_prediction(
         accelerator,
         diffusion,
@@ -461,6 +548,7 @@ def nonfinite_loss_terms(
 
 
 def train_trdn(config: TRDNConfig) -> Dict[str, Any]:
+    config.apply_model_variant()
     if config.validation_num_samples <= 0:
         raise ValueError("validation_num_samples must be positive.")
     if config.validation_num_inference_steps <= 0:
@@ -597,7 +685,13 @@ def train_trdn(config: TRDNConfig) -> Dict[str, Any]:
             },
         )
 
-    if temporal_transformer is not None:
+    if temporal_memory is None:
+        diffusion["unet"], optimizer, train_loader = accelerator.prepare(
+            diffusion["unet"],
+            optimizer,
+            train_loader,
+        )
+    elif temporal_transformer is not None:
         (
             diffusion["unet"],
             temporal_memory,
@@ -718,12 +812,20 @@ def train_trdn(config: TRDNConfig) -> Dict[str, Any]:
                 else:
                     accelerator.backward(total_loss)
                     if accelerator.sync_gradients:
+                        trainable_modules = [
+                            diffusion["unet"],
+                            temporal_memory,
+                            temporal_transformer,
+                            reference_selector,
+                            conditioning_adapter,
+                        ]
                         grad_norm = accelerator.clip_grad_norm_(
-                            list(diffusion["unet"].parameters())
-                            + list(temporal_memory.parameters())
-                            + ([] if temporal_transformer is None else list(temporal_transformer.parameters()))
-                            + list(reference_selector.parameters())
-                            + list(conditioning_adapter.parameters()),
+                            [
+                                parameter
+                                for module in trainable_modules
+                                if module is not None
+                                for parameter in module.parameters()
+                            ],
                             config.max_grad_norm,
                         )
                     optimizer.step()
@@ -739,14 +841,26 @@ def train_trdn(config: TRDNConfig) -> Dict[str, Any]:
                         ema.update(
                             {
                                 "unet": accelerator.unwrap_model(diffusion["unet"]),
-                                "temporal_memory": accelerator.unwrap_model(temporal_memory),
+                                "temporal_memory": (
+                                    accelerator.unwrap_model(temporal_memory)
+                                    if temporal_memory is not None
+                                    else None
+                                ),
                                 "temporal_transformer": (
                                     accelerator.unwrap_model(temporal_transformer)
                                     if temporal_transformer is not None
                                     else None
                                 ),
-                                "reference_selector": accelerator.unwrap_model(reference_selector),
-                                "conditioning_adapter": accelerator.unwrap_model(conditioning_adapter),
+                                "reference_selector": (
+                                    accelerator.unwrap_model(reference_selector)
+                                    if reference_selector is not None
+                                    else None
+                                ),
+                                "conditioning_adapter": (
+                                    accelerator.unwrap_model(conditioning_adapter)
+                                    if conditioning_adapter is not None
+                                    else None
+                                ),
                             }
                         )
                     optimizer.zero_grad(set_to_none=True)
@@ -833,6 +947,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, Any]:
                     seed=config.validation_seed,
                     text_prompt=config.text_prompt,
                     guidance_scale=config.guidance_scale,
+                    diffusion_only=config.model_variant == "diffusion_only",
                 )
                 validation_wall_clock_seconds = float(
                     metrics.get(
