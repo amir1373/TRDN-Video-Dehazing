@@ -19,19 +19,29 @@ from src.train import build_optimizer, build_temporal_modules
 from src.validate import validate_trdn
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Validate TRDN on REVIDE.")
     parser.add_argument("--dataset-root", default="", help="Optional override for config train/test roots.")
     parser.add_argument("--project-root", default="/content/drive/MyDrive/TRDN_REVIDE")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--allow-mode-mismatch", action="store_true")
     parser.add_argument("--max-batches", type=int, default=8)
-    args = parser.parse_args()
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--text-prompt",
+        default="a clear clean dehazed video frame",
+    )
+    return parser
 
+
+def main():
+    args = build_parser().parse_args()
     config = TRDNConfig(
         project_root=args.project_root,
         resume_from_checkpoint=args.checkpoint,
         allow_mode_mismatch=args.allow_mode_mismatch,
+        guidance_scale=args.guidance_scale,
+        text_prompt=args.text_prompt,
     )
     if args.dataset_root:
         config.override_dataset_root(args.dataset_root)
@@ -72,13 +82,14 @@ def main():
         crop_size=config.crop_size,
         random_crop=False,
         extensions=config.image_extensions,
-        synthetic_if_empty=True,
+        synthetic_if_empty=False,
         train_mode=config.train_mode,
         mask_mode=config.mask_mode,
         val_fraction=config.val_fraction,
         split_seed=config.split_seed,
         include_prev_frame=False,
     )
+    dataset.assert_valid_structure("validation")
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     metrics = validate_trdn(
         loader,
@@ -91,6 +102,8 @@ def main():
         device,
         raft_model=raft_model,
         max_batches=args.max_batches,
+        text_prompt=config.text_prompt,
+        guidance_scale=config.guidance_scale,
     )
     print({key: value for key, value in metrics.items() if isinstance(value, float)})
 

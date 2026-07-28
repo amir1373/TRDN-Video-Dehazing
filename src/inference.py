@@ -69,7 +69,7 @@ def run_inference_on_index(config: TRDNConfig, index: int = 0, checkpoint_path: 
         crop_size=config.crop_size,
         random_crop=False,
         extensions=config.image_extensions,
-        synthetic_if_empty=True,
+        synthetic_if_empty=False,
         train_mode=config.train_mode,
         mask_mode=config.mask_mode,
         val_fraction=config.val_fraction,
@@ -93,6 +93,8 @@ def run_inference_on_index(config: TRDNConfig, index: int = 0, checkpoint_path: 
         runtime["device"],
         raft_model=runtime["raft_model"],
         num_steps=config.num_inference_steps,
+        text_prompt=config.text_prompt,
+        guidance_scale=config.guidance_scale,
     )
     save_path = Path(paths["outputs"]) / f"dehazed_index_{index:04d}.png"
     save_image(output["prediction"], save_path)

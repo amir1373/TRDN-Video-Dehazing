@@ -25,6 +25,7 @@ from scripts.evaluate_full_test import (
     load_runtime_for_eval,
 )
 from src.config import TRDNConfig
+from src.progress import ProgressReporter
 from src.provenance import git_state, write_json
 from src.validate import infer_dehazed_batch, infer_diffusion_only_batch
 
@@ -58,6 +59,10 @@ def load_eval_reports(paths: Iterable[Path]) -> List[Dict[str, Any]]:
         report = json.loads(path.read_text(encoding="utf-8"))
         if report.get("is_full_test") is False:
             raise ValueError(f"Refusing paper figures from non-full evaluation: {path}")
+        if report.get("clips_available") is not None and (
+            report.get("clips_evaluated") != report.get("clips_available")
+        ):
+            raise ValueError(f"Refusing incomplete-coverage paper figures: {path}")
         if "aggregate" not in report or "N_frames" not in report:
             raise ValueError(f"Evaluation JSON lacks required aggregate/N_frames fields: {path}")
         reports.append(report)
@@ -248,6 +253,10 @@ def _predict_selected(
                 "fp16" if torch.cuda.is_available() else "no",
             )
         ),
+        guidance_scale=float(report.get("guidance_scale", 1.0)),
+        text_prompt=str(
+            report.get("text_prompt", "a clear clean dehazed video frame")
+        ),
     )
     for key in (
         "allow_tf32",
@@ -279,9 +288,22 @@ def _predict_selected(
             f"Selected index {max(sample_indices)} exceeds variant dataset length {len(dataset)}."
         )
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    runtime = load_runtime_for_eval(config, str(checkpoint), device)
+    diffusion_only = bool(report.get("diffusion_only_baseline", False))
+    runtime = load_runtime_for_eval(
+        config,
+        str(checkpoint),
+        device,
+        diffusion_only=diffusion_only,
+        use_ema=report.get("ema_weights") is not None,
+    )
     identifiers = _sample_ids(dataset)
     outputs = {}
+    progress = ProgressReporter(
+        len(sample_indices),
+        f"Qualitative inference ({report.get('variant', 'variant')})",
+        leave=False,
+        position=1,
+    )
     for dataset_index in sample_indices:
         sample = dataset[dataset_index]
         batch = {
@@ -298,6 +320,9 @@ def _predict_selected(
                 num_steps=int(report["num_inference_steps"]),
                 seed=seed,
                 sample_ids=sample_id,
+                show_progress=False,
+                text_prompt=config.text_prompt,
+                guidance_scale=config.guidance_scale,
             )["prediction"]
         else:
             prediction = infer_dehazed_batch(
@@ -314,12 +339,17 @@ def _predict_selected(
                 num_steps=int(report["num_inference_steps"]),
                 seed=seed,
                 sample_ids=sample_id,
+                show_progress=False,
+                text_prompt=config.text_prompt,
+                guidance_scale=config.guidance_scale,
             )["prediction"]
         outputs[dataset_index] = {
             "hazy": batch["corrupted_frame"].cpu(),
             "prediction": prediction.cpu(),
             "target": batch["target_frame"].cpu(),
         }
+        progress.update(1)
+    progress.close()
     del runtime
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -394,7 +424,7 @@ def generate_qualitative_figures(
     return [qualitative_path, comparison_path]
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--eval-json", type=Path, nargs="+", required=True)
@@ -407,8 +437,10 @@ def main() -> None:
         action="store_true",
         help="Generate JSON-sourced metric/reference figures without loading image/model data.",
     )
-    args = parser.parse_args()
+    return parser
 
+
+def run(args: argparse.Namespace) -> List[Path]:
     reports = load_eval_reports(args.eval_json)
     seed = int(reports[0].get("seed", 1234) if args.seed is None else args.seed)
     sample_indices = select_sample_indices(int(reports[0]["N_frames"]), args.num_samples, seed)
@@ -421,6 +453,11 @@ def main() -> None:
     }
     write_json(args.output_dir / "sample_selection.json", selection)
 
+    progress = ProgressReporter(
+        2 if args.metrics_only else 3,
+        "Paper figure generation",
+        leave=True,
+    )
     generated = generate_metric_figures(
         reports,
         args.eval_json,
@@ -429,6 +466,7 @@ def main() -> None:
         seed,
         sample_indices,
     )
+    progress.update(1)
     generated.extend(
         generate_reference_weight_artifacts(
             reports,
@@ -439,6 +477,7 @@ def main() -> None:
             sample_indices,
         )
     )
+    progress.update(1)
     if not args.metrics_only:
         generated.extend(
             generate_qualitative_figures(
@@ -451,9 +490,16 @@ def main() -> None:
                 sample_indices,
             )
         )
+        progress.update(1)
+    progress.close()
     print(json.dumps(selection, indent=2))
     for path in generated:
-        print(f"Wrote {path}")
+        progress.write(f"Wrote {path}")
+    return generated
+
+
+def main() -> None:
+    run(build_parser().parse_args())
 
 
 if __name__ == "__main__":

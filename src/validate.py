@@ -2,12 +2,12 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
 
 from .assertions import assert_frames, assert_mask, assert_reference_weights, assert_temporal_memory, assert_warped_references
 from .diffusion_adapter import decode_latents_to_images, encode_images_to_latents, get_text_embeddings
 from .flow import compute_warped_references_batch
 from .metrics import psnr_metric, ssim_metric
+from .progress import ProgressReporter
 from .seeding import derive_generator
 
 DEFAULT_EVAL_SEED = 1234
@@ -30,6 +30,9 @@ def infer_dehazed_batch(
     generator: Optional[torch.Generator] = None,
     sample_ids: Optional[List[str]] = None,
     ddim_eta: float = 0.0,
+    show_progress: bool = True,
+    text_prompt: str = "a clear clean dehazed video frame",
+    guidance_scale: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     """Run the full TRDN pipeline for one batch.
 
@@ -39,6 +42,8 @@ def infer_dehazed_batch(
     only randomness is the initial latent noise -- fixing that makes the whole
     trajectory reproducible.
     """
+    if guidance_scale <= 0:
+        raise ValueError(f"guidance_scale must be positive, got {guidance_scale}")
     frames = frames.to(device)
     mask = mask.to(device)
     corrupted = corrupted.to(device)
@@ -66,8 +71,25 @@ def infer_dehazed_batch(
     ref = reference_selector(warped_refs, memory, prior_logits=prior_logits)
     assert_reference_weights(ref["weights"], seq_len=frames.shape[1])
     cond_tokens = conditioning_adapter(memory, ref["reference_feature"])
-    text = get_text_embeddings(diffusion["tokenizer"], diffusion["text_encoder"], batch).to(cond_tokens.dtype)
+    text = get_text_embeddings(
+        diffusion["tokenizer"],
+        diffusion["text_encoder"],
+        batch,
+        prompt=text_prompt,
+    ).to(cond_tokens.dtype)
     encoder_hidden_states = torch.cat([text, cond_tokens], dim=1)
+    unconditional_hidden_states = None
+    if guidance_scale != 1.0:
+        unconditional_text = get_text_embeddings(
+            diffusion["tokenizer"],
+            diffusion["text_encoder"],
+            batch,
+            prompt="",
+        ).to(cond_tokens.dtype)
+        unconditional_hidden_states = torch.cat(
+            [unconditional_text, torch.zeros_like(cond_tokens)],
+            dim=1,
+        )
 
     latent_shape = (batch, 4, frames.shape[-2] // 8, frames.shape[-1] // 8)
     latents = torch.randn(latent_shape, generator=generator, device=device, dtype=cond_tokens.dtype) * scheduler.init_noise_sigma
@@ -76,10 +98,30 @@ def infer_dehazed_batch(
     )
     masked_latents = encode_images_to_latents(diffusion["vae"], corrupted).to(latents.dtype)
 
-    for timestep in tqdm(scheduler.timesteps, desc="DDIM inference", leave=False):
+    progress = ProgressReporter(
+        len(scheduler.timesteps),
+        "DDIM inference",
+        leave=False,
+        position=2,
+        enabled=show_progress,
+    )
+    for timestep in scheduler.timesteps:
         model_input = torch.cat([latents, mask_latent, masked_latents], dim=1)
-        noise_pred = diffusion["unet"](model_input, timestep, encoder_hidden_states=encoder_hidden_states).sample
+        noise_pred = diffusion["unet"](
+            model_input,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+        ).sample
+        if unconditional_hidden_states is not None:
+            unconditional = diffusion["unet"](
+                model_input,
+                timestep,
+                encoder_hidden_states=unconditional_hidden_states,
+            ).sample
+            noise_pred = unconditional + guidance_scale * (noise_pred - unconditional)
         latents = scheduler.step(noise_pred, timestep, latents, eta=ddim_eta, generator=generator).prev_sample
+        progress.update(1)
+    progress.close()
 
     return {
         "prediction": decode_latents_to_images(diffusion["vae"], latents),
@@ -103,6 +145,9 @@ def infer_diffusion_only_batch(
     generator: Optional[torch.Generator] = None,
     sample_ids: Optional[List[str]] = None,
     ddim_eta: float = 0.0,
+    show_progress: bool = True,
+    text_prompt: str = "a clear clean dehazed video frame",
+    guidance_scale: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     """Diffusion-only baseline: SD inpainting on a single frame, no temporal modules.
 
@@ -111,6 +156,8 @@ def infer_diffusion_only_batch(
     Used to isolate how much of TRDN's performance comes from the temporal
     stack vs. the diffusion backbone alone (see scripts/evaluate_full_test.py).
     """
+    if guidance_scale <= 0:
+        raise ValueError(f"guidance_scale must be positive, got {guidance_scale}")
     mask = mask.to(device)
     corrupted = corrupted.to(device)
     assert_mask(mask, corrupted)
@@ -120,7 +167,22 @@ def infer_diffusion_only_batch(
     if generator is None:
         generator = derive_generator(seed if seed is not None else 0, *(sample_ids or ["batch"]), device=device)
 
-    text = get_text_embeddings(diffusion["tokenizer"], diffusion["text_encoder"], batch)
+    text = get_text_embeddings(
+        diffusion["tokenizer"],
+        diffusion["text_encoder"],
+        batch,
+        prompt=text_prompt,
+    )
+    unconditional_text = (
+        get_text_embeddings(
+            diffusion["tokenizer"],
+            diffusion["text_encoder"],
+            batch,
+            prompt="",
+        )
+        if guidance_scale != 1.0
+        else None
+    )
 
     latent_shape = (batch, 4, corrupted.shape[-2] // 8, corrupted.shape[-1] // 8)
     latents = torch.randn(latent_shape, generator=generator, device=device, dtype=text.dtype) * scheduler.init_noise_sigma
@@ -129,10 +191,30 @@ def infer_diffusion_only_batch(
     )
     masked_latents = encode_images_to_latents(diffusion["vae"], corrupted).to(latents.dtype)
 
-    for timestep in tqdm(scheduler.timesteps, desc="Diffusion-only inference", leave=False):
+    progress = ProgressReporter(
+        len(scheduler.timesteps),
+        "Diffusion-only inference",
+        leave=False,
+        position=2,
+        enabled=show_progress,
+    )
+    for timestep in scheduler.timesteps:
         model_input = torch.cat([latents, mask_latent, masked_latents], dim=1)
-        noise_pred = diffusion["unet"](model_input, timestep, encoder_hidden_states=text).sample
+        noise_pred = diffusion["unet"](
+            model_input,
+            timestep,
+            encoder_hidden_states=text,
+        ).sample
+        if unconditional_text is not None:
+            unconditional = diffusion["unet"](
+                model_input,
+                timestep,
+                encoder_hidden_states=unconditional_text,
+            ).sample
+            noise_pred = unconditional + guidance_scale * (noise_pred - unconditional)
         latents = scheduler.step(noise_pred, timestep, latents, eta=ddim_eta, generator=generator).prev_sample
+        progress.update(1)
+    progress.close()
 
     return {"prediction": decode_latents_to_images(diffusion["vae"], latents)}
 
@@ -151,6 +233,8 @@ def validate_trdn(
     max_batches: int = 8,
     num_steps: int = 10,
     seed: Optional[int] = DEFAULT_EVAL_SEED,
+    text_prompt: str = "a clear clean dehazed video frame",
+    guidance_scale: float = 1.0,
 ) -> Dict[str, float]:
     diffusion["unet"].eval()
     temporal_memory.eval()
@@ -160,7 +244,14 @@ def validate_trdn(
     conditioning_adapter.eval()
     psnrs, ssims, lpips_values = [], [], []
     first_output = None
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
+    validation_total = min(len(val_loader), max_batches)
+    progress = ProgressReporter(
+        validation_total,
+        "Validation",
+        leave=False,
+        position=1,
+    )
+    for batch_idx, batch in enumerate(val_loader):
         if batch_idx >= max_batches:
             break
         frames = batch["frames"].to(device)
@@ -183,6 +274,9 @@ def validate_trdn(
             num_steps=num_steps,
             seed=seed,
             sample_ids=sample_ids,
+            show_progress=False,
+            text_prompt=text_prompt,
+            guidance_scale=guidance_scale,
         )
         pred = output["prediction"]
         psnrs.append(psnr_metric(pred[0], target[0]))
@@ -190,6 +284,9 @@ def validate_trdn(
         lpips_values.append(float(loss_bundle.lpips_loss(pred, target).detach().cpu()))
         if first_output is None:
             first_output = output
+        progress.set_postfix({"mean_psnr": f"{np.mean(psnrs):.3f}"})
+        progress.update(1)
+    progress.close()
 
     diffusion["unet"].train()
     temporal_memory.train()

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import shutil
 import subprocess
 import time
@@ -30,6 +31,19 @@ NUMERICS_FIELDS = (
     "enable_torch_compile",
     "channels_last",
 )
+RESUME_MUTABLE_CONFIG_FIELDS = {
+    "resume_from_checkpoint",
+    "allow_mode_mismatch",
+    "allow_output_collision",
+    "max_train_steps",
+    "num_epochs",
+    "run_name",
+    "log_every",
+    "validate_every",
+    "checkpoint_every",
+    "keep_last_n_checkpoints",
+    "always_keep_best",
+}
 
 
 def _run_git(*args: str) -> str:
@@ -64,6 +78,78 @@ def numerics_settings(config: TRDNConfig) -> Dict[str, Any]:
     return {name: getattr(config, name) for name in NUMERICS_FIELDS}
 
 
+def comparable_run_config(config: TRDNConfig | Mapping[str, Any]) -> Dict[str, Any]:
+    values = config.to_dict() if isinstance(config, TRDNConfig) else dict(config)
+    return {
+        key: value
+        for key, value in values.items()
+        if key not in RESUME_MUTABLE_CONFIG_FIELDS
+    }
+
+
+def config_fingerprint(config: TRDNConfig | Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        comparable_run_config(config),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def ensure_project_config_compatible(config: TRDNConfig) -> Path:
+    root = Path(config.project_root)
+    root.mkdir(parents=True, exist_ok=True)
+    marker = root / "project_config.json"
+    current = {
+        "config_fingerprint": config_fingerprint(config),
+        "config": comparable_run_config(config),
+    }
+    existing_sources = []
+    if marker.exists():
+        existing_sources.append((marker, json.loads(marker.read_text(encoding="utf-8"))))
+    for manifest_path in sorted((root / "logs" / "runs").glob("*/run_manifest.json")):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Output directory collision check could not read {manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(manifest.get("config"), dict):
+            raise RuntimeError(
+                f"Output directory collision check found no config in {manifest_path}."
+            )
+        existing_config = comparable_run_config(manifest["config"])
+        existing_sources.append(
+            (
+                manifest_path,
+                {
+                    "config_fingerprint": config_fingerprint(existing_config),
+                    "config": existing_config,
+                },
+            )
+        )
+
+    for source_path, existing in existing_sources:
+        if existing.get("config_fingerprint") != current["config_fingerprint"]:
+            existing_config = existing.get("config", {})
+            differences = {
+                key: {"existing": existing_config.get(key), "current": value}
+                for key, value in current["config"].items()
+                if existing_config.get(key) != value
+            }
+            if not config.allow_output_collision:
+                raise RuntimeError(
+                    "Output directory collision: project_root already belongs to a different "
+                    f"configuration ({source_path}). Use a unique project root for each ablation. "
+                    "Only pass --allow-output-collision after reviewing these differences: "
+                    + json.dumps(differences, sort_keys=True, default=str)
+                )
+    if not marker.exists():
+        write_json(marker, current)
+    return marker
+
+
 def checkpoint_metadata(
     config: TRDNConfig,
     step: int,
@@ -88,6 +174,17 @@ def checkpoint_metadata(
         "crop_size": int(config.crop_size),
         "loss_weights": loss_weights(config),
         "numerics": numerics_settings(config),
+        "config_fingerprint": config_fingerprint(config),
+        "quality_settings": {
+            "text_prompt": config.text_prompt,
+            "guidance_scale": config.guidance_scale,
+            "enable_ema": config.enable_ema,
+            "ema_decay": config.ema_decay,
+            "lr_schedule": config.lr_schedule,
+            "lr_warmup_steps": config.lr_warmup_steps,
+            "enable_linear_lr_scaling": config.enable_linear_lr_scaling,
+            "lr_reference_batch_size": config.lr_reference_batch_size,
+        },
         "checkpoint_retention": {
             "keep_last_n_checkpoints": int(config.keep_last_n_checkpoints),
             "always_keep_best": bool(config.always_keep_best),
@@ -308,6 +405,43 @@ def find_numerics_mismatches(
                 {
                     "manifest_path": str(manifest_path.resolve()),
                     "differences": differences,
+                }
+            )
+    return mismatches
+
+
+def find_seed_mismatches(logs_root: Path, config: TRDNConfig) -> list[Dict[str, Any]]:
+    mismatches = []
+    project_root = logs_root.parent
+    candidates = {
+        path.resolve()
+        for path in (
+            list((project_root / "logs" / "runs").glob("*/run_manifest.json"))
+            + list(
+                project_root.parent.glob(
+                    "*/logs/runs/*/run_manifest.json"
+                )
+            )
+        )
+    }
+    for manifest_path in sorted(candidates):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            mismatches.append(
+                {
+                    "manifest_path": str(manifest_path),
+                    "warning": f"could not inspect sibling seed: {type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+        existing_seed = manifest.get("config", {}).get("seed")
+        if existing_seed is not None and int(existing_seed) != int(config.seed):
+            mismatches.append(
+                {
+                    "manifest_path": str(manifest_path.resolve()),
+                    "existing_seed": int(existing_seed),
+                    "current_seed": int(config.seed),
                 }
             )
     return mismatches

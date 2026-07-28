@@ -230,10 +230,13 @@ Both modes use REVIDE only.
 
 Notebook:
 
-1. Set `DATASET_ROOT`.
-2. Run setup/debug cells.
-3. Set `cfg.run_training_now = True`.
-4. Run the training cell.
+1. Edit the single `/workspace` configuration cell.
+2. Fill every `TODO` in `configs/a40.yaml` from the A40 benchmark.
+3. Run the dataset guard, repository setup, and dependency cells.
+4. Run preflight, training, full evaluation, figures, and tables in order.
+
+The notebook is only a driver. It does not assign `train_mode`, select a
+resume checkpoint, or reimplement analysis logic.
 
 Script:
 
@@ -261,16 +264,35 @@ Every run creates `logs/runs/<run>/run_manifest.json` and an append-only
 inventory, parameter counts, runtime environment, elapsed time, and peak GPU
 memory.
 
-Before a billed training run, execute the real-data/real-weight preflight:
+Before a billed training run, execute the real-data preflight. Before the
+first checkpoint exists, omit `--checkpoint`:
 
 ```bash
 python scripts/preflight.py \
-  --checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/last \
-  --dataset-root /content/drive/MyDrive/REVIDE_sequences \
-  --project-root /content/drive/MyDrive/TRDN_REVIDE
+  --dataset-root /workspace/datasets/REVIDE \
+  --project-root /workspace/trdn_runs \
+  --preset configs/a40.yaml
 ```
 
-Preflight refuses synthetic fallback and writes `preflight_report.json`.
+Preflight refuses synthetic fallback, prints the discovered paired layout,
+measures a temporary checkpoint when needed, checks the retention projection
+against free disk, and writes `preflight_report.json`.
+
+Run the CPU-only orchestration smoke test before renting a GPU:
+
+```bash
+python scripts/smoke_test.py
+```
+
+It uses tiny local model stubs and a generated on-disk REVIDE tree, but
+exercises preflight, training, checkpoint save/resume, full and diffusion-only
+evaluation, figures with sidecars, and tables.
+
+Each ablation must use a unique `--project-root` (for example
+`/workspace/runs/full`, `/workspace/runs/no_raft`, and
+`/workspace/runs/no_transformer`). Training refuses a project root already
+claimed by a different configuration unless `--allow-output-collision` is
+explicit.
 
 ## How to Validate
 
@@ -333,6 +355,25 @@ Writes a JSON report (per-clip and aggregate PSNR/SSIM/LPIPS/temporal
 consistency, plus `N`, `seed`, `num_inference_steps`, `checkpoint_path`,
 `train_mode`, `mask_mode`, and the current git commit hash) next to the
 checkpoint by default, or to `--output`.
+
+Every discovered test sequence is accounted for as evaluated or skipped with
+a recorded reason. `--debug-max-clips` is the only clip cap and stamps output
+as `DEBUG_PARTIAL`. Optional `--step-sweep 20 30 50` writes separate full
+reports without automatically choosing the best result.
+
+Before training, measure the VAE round-trip ceiling at the configured
+resolution:
+
+```bash
+python scripts/vae_ceiling.py \
+  --dataset-root /workspace/datasets/REVIDE \
+  --output /workspace/trdn_runs/vae_ceiling.json \
+  --resolution 256
+```
+
+See [`docs/ACCURACY_AUDIT.md`](docs/ACCURACY_AUDIT.md) for the current
+resolution, EMA, LR schedule/scaling, guidance, prompt, validation, and
+checkpoint-selection review. Quality-changing controls remain opt-in.
 
 Paper artifacts must be generated from that JSON:
 

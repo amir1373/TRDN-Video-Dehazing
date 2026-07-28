@@ -2,8 +2,10 @@
 
 import argparse
 import json
+import shutil
 import statistics
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -24,7 +26,9 @@ from src.presets import apply_numerics_preset
 from src.provenance import (
     dataset_size,
     effective_mask_mode,
+    ensure_project_config_compatible,
     find_numerics_mismatches,
+    find_seed_mismatches,
     loss_weights,
     peak_gpu_memory_bytes,
     runtime_environment,
@@ -40,6 +44,7 @@ from src.train import (
     make_test_dataset_for_manifest,
 )
 from src.diffusion_adapter import load_diffusion_backbone
+from src.ema import EMAState
 
 
 def _banner(label: str) -> None:
@@ -51,16 +56,31 @@ def _checkpoint_size_bytes(path: Path) -> int:
     return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
 
 
+def assert_checkpoint_storage_fits(
+    checkpoint_bytes: int,
+    retained_count: int,
+    free_disk_bytes: int,
+) -> int:
+    projected = checkpoint_bytes * retained_count
+    if free_disk_bytes < projected:
+        raise RuntimeError(
+            "Insufficient free disk for checkpoint retention policy: "
+            f"free={free_disk_bytes} bytes projected={projected} bytes "
+            f"({retained_count} retained checkpoints at {checkpoint_bytes} bytes each)."
+        )
+    return projected
+
+
 def _sequence_names(dataset: Any) -> set[str]:
     return {sequence["name"] for sequence in dataset.sequences}
 
 
 def _require_real_dataset(dataset: Any, split: str) -> None:
-    if not dataset.sequences or not dataset.index:
-        raise RuntimeError(
-            f"{split} dataset has no real sequences/clips at {dataset.root}. "
-            "Preflight never uses synthetic fallback."
-        )
+    print(f"{split} dataset layout:")
+    print(json.dumps(dataset.layout_inventory(), indent=2, sort_keys=True))
+    dataset.assert_valid_structure(split)
+    if not dataset.index:
+        raise RuntimeError(f"{split} dataset has no eligible real clips at {dataset.root}.")
 
 
 def _check_reference_integrity(dataset: Any, batch_size: int, num_batches: int) -> list[Dict[str, Any]]:
@@ -112,6 +132,9 @@ def _prepare_timing_runtime(config: TRDNConfig, train_loader: DataLoader, checkp
         "reference_selector": reference_selector,
         "conditioning_adapter": conditioning_adapter,
     }
+    ema = EMAState(modules, config.ema_decay) if config.enable_ema else None
+    if ema is not None:
+        accelerator.register_for_checkpointing(ema)
     optimizer = build_optimizer(
         config,
         diffusion["unet"],
@@ -181,6 +204,7 @@ def _prepare_timing_runtime(config: TRDNConfig, train_loader: DataLoader, checkp
         "loss_bundle": LossBundle(str(accelerator.device)),
         "raft_model": raft_model,
         "parameter_counts": counts,
+        "ema": ema,
     }
 
 
@@ -274,11 +298,26 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         mixed_precision=args.mixed_precision,
         keep_last_n_checkpoints=args.keep_last_n_checkpoints,
         num_inference_steps=args.num_steps,
+        allow_output_collision=args.allow_output_collision,
+        enable_ema=args.enable_ema,
+        ema_decay=args.ema_decay,
+        lr_schedule=args.lr_schedule,
+        lr_warmup_steps=args.lr_warmup_steps,
+        enable_linear_lr_scaling=args.enable_linear_lr_scaling,
+        lr_reference_batch_size=args.lr_reference_batch_size,
+        guidance_scale=args.guidance_scale,
+        text_prompt=args.text_prompt,
     )
     if args.preset:
         apply_numerics_preset(config, args.preset)
     if args.dataset_root:
         config.override_dataset_root(args.dataset_root)
+    print(f"Resolved preflight seed: {config.seed}")
+    seed_mismatches = find_seed_mismatches(Path(config.paths()["logs"]), config)
+    if seed_mismatches:
+        _banner("SEED WARNING")
+        print(json.dumps(seed_mismatches, indent=2, sort_keys=True))
+    ensure_project_config_compatible(config)
 
     resolved_mask = effective_mask_mode(config.train_mode, config.mask_mode)
     print(f"Resolved train_mode={config.train_mode!r}, mask_mode={resolved_mask!r}")
@@ -294,6 +333,13 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         if not checkpoint.is_dir():
             raise FileNotFoundError(f"Real checkpoint directory does not exist: {checkpoint}")
         validate_checkpoint_modes(checkpoint, config, allow_mode_mismatch=False)
+        early_checkpoint_bytes = _checkpoint_size_bytes(checkpoint)
+        early_retained_upper_bound = config.keep_last_n_checkpoints + 3
+        assert_checkpoint_storage_fits(
+            early_checkpoint_bytes,
+            early_retained_upper_bound,
+            shutil.disk_usage(config.project_root).free,
+        )
 
     numerics_mismatches = find_numerics_mismatches(Path(config.paths()["logs"]), config)
     if numerics_mismatches:
@@ -339,7 +385,7 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
         drop_last=True,
     )
     if torch.cuda.is_available():
@@ -369,28 +415,43 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         timing["temporal_disabled_seconds_per_step_median"] * total_steps / 3600.0
     )
 
-    checkpoint_bytes = _checkpoint_size_bytes(checkpoint) if checkpoint is not None else None
+    if checkpoint is not None:
+        checkpoint_bytes = _checkpoint_size_bytes(checkpoint)
+        checkpoint_measurement = "existing_checkpoint"
+    else:
+        with tempfile.TemporaryDirectory(
+            prefix=".preflight_checkpoint_",
+            dir=config.project_root,
+        ) as temporary:
+            timing_runtime["accelerator"].save_state(temporary)
+            if timing_runtime["ema"] is not None:
+                timing_runtime["ema"].save_weights(
+                    Path(temporary) / "ema_weights.pt"
+                )
+            checkpoint_bytes = _checkpoint_size_bytes(Path(temporary))
+        checkpoint_measurement = "temporary_runtime_checkpoint"
     periodic_saves = total_steps // max(config.checkpoint_every, 1)
     retained_step_checkpoints = min(periodic_saves, config.keep_last_n_checkpoints)
     retained_named_checkpoints = 3  # last, best_psnr, best_ssim; best_* are never pruned
     retained_count_upper_bound = retained_step_checkpoints + retained_named_checkpoints
-    storage_bytes = (
-        checkpoint_bytes * retained_count_upper_bound
-        if checkpoint_bytes is not None
-        else None
+    free_disk_bytes = shutil.disk_usage(config.project_root).free
+    storage_bytes = assert_checkpoint_storage_fits(
+        checkpoint_bytes,
+        retained_count_upper_bound,
+        free_disk_bytes,
     )
     storage = {
         "measured_checkpoint_path": str(checkpoint.resolve()) if checkpoint is not None else None,
         "measured_checkpoint_bytes": checkpoint_bytes,
+        "checkpoint_measurement": checkpoint_measurement,
         "retained_checkpoint_count_upper_bound": retained_count_upper_bound,
         "estimated_retained_storage_bytes": storage_bytes,
-        "estimated_retained_storage_gb": (
-            storage_bytes / 1_000_000_000.0 if storage_bytes is not None else None
-        ),
-        "warning_over_100_gb": (
-            storage_bytes > 100_000_000_000 if storage_bytes is not None else False
-        ),
-        "status": "measured" if checkpoint is not None else "unavailable_before_first_checkpoint",
+        "estimated_retained_storage_gb": storage_bytes / 1_000_000_000.0,
+        "free_disk_bytes": free_disk_bytes,
+        "free_disk_gb": free_disk_bytes / 1_000_000_000.0,
+        "fits_free_disk": True,
+        "warning_over_100_gb": storage_bytes > 100_000_000_000,
+        "status": "measured",
     }
 
     if checkpoint is not None:
@@ -449,6 +510,7 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         "dataset_sizes": sizes,
         "sequence_overlaps": overlaps,
         "numerics_mismatch_warnings": numerics_mismatches,
+        "seed_mismatch_warnings": seed_mismatches,
         "reference_integrity": integrity,
         "active_losses": active_losses,
         "trainable_parameters": timing_runtime["parameter_counts"],
@@ -492,6 +554,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-steps", type=int, default=3)
     parser.add_argument("--timed-steps", type=int, default=10)
     parser.add_argument("--preset", default="", help="Filled numerics YAML preset.")
+    parser.add_argument("--allow-output-collision", action="store_true")
+    parser.add_argument("--enable-ema", action="store_true")
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=["constant", "warmup_cosine"],
+        default="constant",
+    )
+    parser.add_argument("--lr-warmup-steps", type=int, default=0)
+    parser.add_argument("--enable-linear-lr-scaling", action="store_true")
+    parser.add_argument("--lr-reference-batch-size", type=int, default=1)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--text-prompt",
+        default="a clear clean dehazed video frame",
+    )
     return parser
 
 
@@ -508,8 +586,12 @@ def main() -> None:
         failure = {"status": "FAIL", "error_type": type(exc).__name__, "error": str(exc)}
         try:
             write_json(report_path, failure)
-        except Exception:
-            pass
+        except Exception as report_exc:
+            print(
+                "WARNING: could not write the preflight failure report: "
+                f"{type(report_exc).__name__}: {report_exc}",
+                file=sys.stderr,
+            )
         _banner("FAIL")
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

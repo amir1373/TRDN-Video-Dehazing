@@ -30,6 +30,10 @@ def load_reports(paths: Iterable[Path]) -> List[Dict[str, Any]]:
         report = json.loads(path.read_text(encoding="utf-8"))
         if report.get("is_full_test") is False:
             raise ValueError(f"Refusing to emit a paper table from non-full evaluation: {path}")
+        if report.get("clips_available") is not None and (
+            report.get("clips_evaluated") != report.get("clips_available")
+        ):
+            raise ValueError(f"Refusing incomplete-coverage paper table: {path}")
         report["_source_path"] = str(path.resolve())
         reports.append(report)
     if not reports:
@@ -109,13 +113,15 @@ def write_csv(path: Path, reports: List[Dict[str, Any]]) -> None:
             writer.writerow(row)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--eval-json", type=Path, nargs="+", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--basename", default="paper_results")
-    args = parser.parse_args()
+    return parser
 
+
+def run(args: argparse.Namespace) -> List[Path]:
     reports = load_reports(args.eval_json)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     markdown = render_markdown(reports)
@@ -126,6 +132,11 @@ def main() -> None:
     print(markdown, end="")
     print(f"Wrote {markdown_path}")
     print(f"Wrote {csv_path}")
+    return [markdown_path, csv_path]
+
+
+def main() -> None:
+    run(build_parser().parse_args())
 
 
 if __name__ == "__main__":

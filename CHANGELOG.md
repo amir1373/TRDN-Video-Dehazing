@@ -7,6 +7,31 @@ dehazing at all, plus several related issues. This change fixes the pipeline
 to measure the intended task, without changing or inventing any previously
 reported numbers.
 
+### Paid-run readiness final pass
+
+- Added a CPU-only end-to-end smoke pipeline covering preflight, training,
+  checkpointing, crash/resume, full and diffusion-only evaluation, paper
+  figures, and tables. The crash test verifies optimizer step restoration,
+  appended metrics, and EMA checkpoint state.
+- Hardened REVIDE discovery against missing, empty, mismatched, too-short,
+  undecodable, and inconsistent-size sequences. Preflight now prints the
+  discovered layout and refuses insufficient checkpoint retention capacity.
+- Added project configuration collision protection, checkpoint fingerprints,
+  seed mismatch warnings, complete evaluation sample accounting, and explicit
+  debug-only partial evaluation stamps.
+- Diffusion-only evaluation now loads only U-Net weights and never constructs
+  temporal modules or RAFT. Paper outputs refuse partial or incomplete
+  evaluation reports.
+- Added default-off EMA, warmup-cosine LR scheduling, linear LR scaling, and
+  classifier-free guidance controls with checkpoint and manifest provenance.
+- Added deterministic VAE-ceiling measurement, explicit DDIM step sweeps,
+  progress reporting for interactive and redirected runs, CLI contract checks,
+  dependency auditing, and a documented accuracy audit.
+- Removed the approximate SSIM fallback so missing or failed metric
+  dependencies stop evaluation instead of silently changing the metric.
+- No CUDA benchmarks, timings, throughput, or memory measurements were run or
+  inferred during this pass.
+
 ### Runtime safety and A40 preparation
 
 - LPIPS initialization now fails loudly and runs a non-zero startup probe

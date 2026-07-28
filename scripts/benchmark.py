@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.preflight import _prepare_timing_runtime, _require_real_dataset
 from src.config import TRDNConfig
 from src.provenance import write_json
+from src.progress import ProgressReporter
 from src.train import compute_training_loss, make_datasets, nonfinite_loss_terms
 
 
@@ -110,6 +111,12 @@ def _measure_variant(
     overflow_skips = 0
     signature = None
     warmup_started = time.perf_counter()
+    progress = ProgressReporter(
+        warmup_steps + timed_steps,
+        f"Benchmark {name}",
+        leave=False,
+        position=1,
+    )
 
     for step_index in range(warmup_steps + timed_steps):
         step_started = time.perf_counter()
@@ -162,6 +169,11 @@ def _measure_variant(
             gpu_durations.append(gpu_elapsed)
             data_wait_durations.append(data_wait)
             raft_seconds += timing.get("raft_seconds", 0.0)
+        progress.set_postfix(
+            {"phase": "warmup" if step_index < warmup_steps else "steady"}
+        )
+        progress.update(1)
+    progress.close()
 
     warmup_seconds = time.perf_counter() - warmup_started - sum(total_durations)
     median_step = statistics.median(total_durations)
@@ -308,13 +320,18 @@ def main() -> None:
     baseline_signature = None
     baseline_seconds = None
     seen = set()
-    for name, category, overrides in _variant_matrix(
-        baseline,
-        args.max_batch_size,
-        args.num_workers,
-    ):
+    variants = list(
+        _variant_matrix(
+            baseline,
+            args.max_batch_size,
+            args.num_workers,
+        )
+    )
+    progress = ProgressReporter(len(variants), "A40 benchmark variants", leave=True)
+    for name, category, overrides in variants:
         signature_key = tuple(sorted(overrides.items()))
         if signature_key in seen:
+            progress.update(1)
             continue
         seen.add(signature_key)
         config = replace(baseline, **overrides)
@@ -354,6 +371,9 @@ def main() -> None:
                 "overrides": overrides,
             }
         rows.append(row)
+        progress.set_postfix({"variant": name, "status": row["status"]})
+        progress.update(1)
+    progress.close()
 
     combined = [
         row
