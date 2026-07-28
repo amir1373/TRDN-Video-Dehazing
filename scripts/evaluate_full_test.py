@@ -22,6 +22,8 @@ sequences) is for. This script is the only place test data should be read.
 import argparse
 import json
 import subprocess
+import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,17 +31,25 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from src.config import TRDNConfig
 from src.dataset import REVIDESequenceDataset
 from src.diffusion_adapter import load_diffusion_backbone
 from src.flow import flow_warped_temporal_consistency_error, load_raft
 from src.losses import LossBundle
 from src.metrics import psnr_metric, ssim_metric
+from src.provenance import (
+    append_evaluation_to_manifest,
+    load_checkpoint_metadata,
+    peak_gpu_memory_bytes,
+    validate_checkpoint_modes,
+    write_json,
+)
 from src.train import build_optimizer, build_temporal_modules
 from src.validate import infer_dehazed_batch, infer_diffusion_only_batch
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
 
 def git_commit_hash() -> str:
     try:
@@ -49,6 +59,8 @@ def git_commit_hash() -> str:
 
 
 def load_runtime_for_eval(config: TRDNConfig, checkpoint_path: str, device: str) -> Dict[str, Any]:
+    if checkpoint_path:
+        validate_checkpoint_modes(checkpoint_path, config)
     diffusion = load_diffusion_backbone(config, device=device)
     temporal_memory, temporal_transformer, reference_selector, conditioning_adapter = build_temporal_modules(
         config, diffusion["unet"].config.cross_attention_dim, device
@@ -107,7 +119,15 @@ def group_index_by_clip(dataset: REVIDESequenceDataset) -> Dict[int, List[int]]:
 
 
 @torch.no_grad()
-def evaluate(config: TRDNConfig, args: argparse.Namespace, device: str) -> Dict[str, Any]:
+def evaluate(
+    config: TRDNConfig,
+    args: argparse.Namespace,
+    device: str,
+    max_clips: int | None = None,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     dataset = build_test_dataset(config, args)
     if not dataset.index:
         raise RuntimeError(
@@ -132,7 +152,15 @@ def evaluate(config: TRDNConfig, args: argparse.Namespace, device: str) -> Dict[
     all_temporal_coverage: List[float] = []
     total_frames = 0
 
-    for seq_idx in sorted(by_clip):
+    evaluated_seq_indices = sorted(by_clip)
+    if max_clips is not None:
+        evaluated_seq_indices = evaluated_seq_indices[:max_clips]
+
+    reference_weight_sum = np.zeros(config.seq_len - 1, dtype=np.float64)
+    reference_weight_sum_squares = np.zeros(config.seq_len - 1, dtype=np.float64)
+    reference_weight_count = np.zeros(config.seq_len - 1, dtype=np.int64)
+
+    for seq_idx in evaluated_seq_indices:
         clip_name = clip_names[seq_idx]
         dataset_indices = by_clip[seq_idx]  # already ascending by construction of dataset.index
         clip_psnr, clip_ssim, clip_lpips, clip_temporal_error, clip_temporal_coverage = [], [], [], [], []
@@ -183,6 +211,13 @@ def evaluate(config: TRDNConfig, args: argparse.Namespace, device: str) -> Dict[
             prev_prediction = prediction
             total_frames += 1
 
+            weights = output.get("reference_weights")
+            if weights is not None:
+                weights_np = weights.detach().float().cpu().numpy()
+                reference_weight_sum += weights_np.sum(axis=(0, 2, 3))
+                reference_weight_sum_squares += np.square(weights_np).sum(axis=(0, 2, 3))
+                reference_weight_count += weights_np.shape[0] * weights_np.shape[2] * weights_np.shape[3]
+
         clip_result = {
             "sequence_name": clip_name,
             "num_frames": len(dataset_indices),
@@ -205,17 +240,54 @@ def evaluate(config: TRDNConfig, args: argparse.Namespace, device: str) -> Dict[
         arr = np.asarray(values, dtype=np.float64)
         return {"mean": float(arr.mean()), "std": float(arr.std())}
 
+    reference_weights = []
+    for index in range(config.seq_len - 1):
+        count = int(reference_weight_count[index])
+        if count:
+            mean = reference_weight_sum[index] / count
+            variance = max(reference_weight_sum_squares[index] / count - mean * mean, 0.0)
+            std = float(np.sqrt(variance))
+            mean_value: Optional[float] = float(mean)
+        else:
+            mean_value, std = None, None
+        reference_weights.append(
+            {
+                "offset": index - (config.seq_len - 1),
+                "mean": mean_value,
+                "std": std,
+                "count": count,
+            }
+        )
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    try:
+        checkpoint_metadata = load_checkpoint_metadata(args.checkpoint) if args.checkpoint else {}
+    except FileNotFoundError:
+        checkpoint_metadata = {}
     return {
+        "schema_version": 2,
+        "variant": getattr(args, "variant", "") or (
+            "diffusion_only" if args.diffusion_only else f"trdn_t{config.seq_len}"
+        ),
         "checkpoint_path": args.checkpoint,
+        "checkpoint_git_sha": checkpoint_metadata.get("git_commit_sha", "unknown"),
         "train_mode": dataset.train_mode,
         "mask_mode": dataset._resolve_mask_mode(),
         "diffusion_only_baseline": args.diffusion_only,
         "seed": args.seed,
         "num_inference_steps": args.num_steps,
         "crop_size": args.crop_size,
+        "seq_len": config.seq_len,
+        "dataset_root": config.dataset_root,
+        "test_root": config.root_for_split("test"),
         "git_commit": git_commit_hash(),
+        "evaluation_scope": "full_test" if max_clips is None else "preflight_subset",
+        "is_full_test": max_clips is None,
         "N_clips": len(per_clip_results),
         "N_frames": total_frames,
+        "runtime_seconds": time.perf_counter() - started,
+        "peak_gpu_memory_bytes": peak_gpu_memory_bytes(),
         "aggregate": {
             "psnr": _mean_std(all_psnr),
             "ssim": _mean_std(all_ssim),
@@ -223,8 +295,37 @@ def evaluate(config: TRDNConfig, args: argparse.Namespace, device: str) -> Dict[
             "temporal_consistency_l1": _mean_std(all_temporal_error),
             "temporal_consistency_coverage": _mean_std(all_temporal_coverage),
         },
+        "reference_weights_by_offset": reference_weights,
         "per_clip": per_clip_results,
     }
+
+
+def record_evaluation_manifest(
+    checkpoint_path: str,
+    output_path: Path,
+    results: Dict[str, Any],
+) -> Path:
+    try:
+        metadata = load_checkpoint_metadata(checkpoint_path)
+    except FileNotFoundError:
+        metadata = {}
+    configured_path = metadata.get("run_manifest_path")
+    manifest_path = Path(configured_path) if configured_path else output_path.parent / "run_manifest.json"
+    append_evaluation_to_manifest(
+        manifest_path,
+        {
+            "output_path": str(output_path.resolve()),
+            "variant": results["variant"],
+            "seed": results["seed"],
+            "num_inference_steps": results["num_inference_steps"],
+            "N_clips": results["N_clips"],
+            "N_frames": results["N_frames"],
+            "wall_clock_seconds": results["runtime_seconds"],
+            "peak_gpu_memory_bytes": results["peak_gpu_memory_bytes"],
+            "git_commit": results["git_commit"],
+        },
+    )
+    return manifest_path
 
 
 def main() -> None:
@@ -234,8 +335,11 @@ def main() -> None:
     parser.add_argument("--dataset-root", default="", help="Optional override for config.test_root's parent.")
     parser.add_argument("--num-steps", type=int, required=True, help="DDIM inference steps (no hardcoded default).")
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--seq-len", type=int, default=10)
     parser.add_argument("--train-mode", default="dehaze", choices=["dehaze", "reconstruct_synthetic"])
     parser.add_argument("--mask-mode", default="auto")
+    parser.add_argument("--allow-mode-mismatch", action="store_true")
+    parser.add_argument("--variant", default="", help="Stable label used by figures and tables.")
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument(
         "--diffusion-only",
@@ -245,19 +349,27 @@ def main() -> None:
     parser.add_argument("--output", default="", help="Output JSON path. Defaults next to the checkpoint.")
     args = parser.parse_args()
 
-    config = TRDNConfig(project_root=args.project_root, resume_from_checkpoint=args.checkpoint)
+    config = TRDNConfig(
+        project_root=args.project_root,
+        resume_from_checkpoint=args.checkpoint,
+        allow_mode_mismatch=args.allow_mode_mismatch,
+        seq_len=args.seq_len,
+        train_mode=args.train_mode,
+        mask_mode=args.mask_mode,
+    )
     if args.dataset_root:
-        config.dataset_root = args.dataset_root
-        config.test_root = args.dataset_root
+        config.override_dataset_root(args.dataset_root)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     results = evaluate(config, args, device)
 
     output_path = Path(args.output) if args.output else Path(args.checkpoint).parent / "evaluate_full_test.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    write_json(output_path, results)
+    manifest_path = record_evaluation_manifest(args.checkpoint, output_path, results)
     print(json.dumps({k: v for k, v in results.items() if k != "per_clip"}, indent=2))
     print(f"Wrote {output_path}")
+    print(f"Updated {manifest_path}")
 
 
 if __name__ == "__main__":

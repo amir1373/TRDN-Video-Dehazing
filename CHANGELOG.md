@@ -7,6 +7,20 @@ dehazing at all, plus several related issues. This change fixes the pipeline
 to measure the intended task, without changing or inventing any previously
 reported numbers.
 
+### Neutral summary
+
+- Default training mode is now dehaze: temporal references and the current
+  frame are taken from real hazy inputs.
+- Validation is a seeded holdout of training sequences; test data is no
+  longer used for model selection.
+- Temporal consistency compares the current prediction against the warped
+  previous prediction.
+- Full-test evaluation uses seeded deterministic sampling and a flow-warped
+  temporal consistency metric, with a diffusion-only frame-by-frame baseline.
+- Run manifests, on-disk metric logs, checkpoint retention, reporting
+  scripts, and real-data preflight checks make run provenance and cost
+  explicit.
+
 ### Fixed
 
 - **Ground-truth leak in training (root cause).** `train_mode="reconstruct"`
@@ -90,6 +104,18 @@ reported numbers.
   new mask modes, the new/legacy loss functions, `warp_with_flow`'s
   generalization to non-RGB tensors, deterministic seeding, and
   `dry_run_shape_test` in both `train_mode`s.
+- Checkpoint metadata records the resolved modes, seed, git SHA, dataset root,
+  temporal/crop dimensions, effective loss weights, and originating run
+  manifest. Resume validates mode compatibility before loading weights.
+- Each training run writes an isolated `run_manifest.json` and append-only
+  `metrics.jsonl`; evaluation appends measured wall-clock and peak-memory
+  usage to the same manifest.
+- `scripts/preflight.py` performs real-data/reference-integrity checks,
+  real-weight seed determinism checks, parameter/data inventory, temporal
+  loss overhead timing, schedule estimates, and checkpoint storage estimates.
+- `scripts/make_paper_figures.py` and `scripts/emit_paper_tables.py` generate
+  deterministic figures and direction-aware tables directly from evaluation
+  JSON rather than hand-transcribed values.
 
 ### Changed
 
@@ -98,4 +124,6 @@ reported numbers.
   implementation) can warp both RGB predictions and 2-channel flow fields
   (needed by the eval script's forward-backward consistency check).
 - Architecture (4 transformer layers / 8 heads / dim 256 / pool 8), the AdamW
-  two-group optimizer setup, and checkpointing are unchanged.
+  two-group optimizer setup, and Accelerate's checkpoint contents are
+  unchanged. Numbered `step_*` directories now retain only the configured
+  newest count (default 3); named `best_*` checkpoints are never pruned.

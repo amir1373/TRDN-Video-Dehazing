@@ -250,6 +250,28 @@ python scripts/train_colab.py \
   --resume-from-checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/last
 ```
 
+Resume validates `train_mode` and the resolved `mask_mode` from checkpoint
+metadata before loading weights. Use `--allow-mode-mismatch` only for a
+deliberate override. Numbered checkpoints retain the newest three by default;
+set `--keep-last-n-checkpoints` to change that count. Named `best_*`
+checkpoints are never pruned.
+
+Every run creates `logs/runs/<run>/run_manifest.json` and an append-only
+`metrics.jsonl`. The manifest records the resolved config, git state, split
+inventory, parameter counts, runtime environment, elapsed time, and peak GPU
+memory.
+
+Before a billed training run, execute the real-data/real-weight preflight:
+
+```bash
+python scripts/preflight.py \
+  --checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/last \
+  --dataset-root /content/drive/MyDrive/REVIDE_sequences \
+  --project-root /content/drive/MyDrive/TRDN_REVIDE
+```
+
+Preflight refuses synthetic fallback and writes `preflight_report.json`.
+
 ## How to Validate
 
 ```bash
@@ -311,6 +333,24 @@ Writes a JSON report (per-clip and aggregate PSNR/SSIM/LPIPS/temporal
 consistency, plus `N`, `seed`, `num_inference_steps`, `checkpoint_path`,
 `train_mode`, `mask_mode`, and the current git commit hash) next to the
 checkpoint by default, or to `--output`.
+
+Paper artifacts must be generated from that JSON:
+
+```bash
+python scripts/make_paper_figures.py \
+  --checkpoint /content/drive/MyDrive/TRDN_REVIDE/checkpoints/best_psnr \
+  --eval-json /content/drive/MyDrive/TRDN_REVIDE/evaluate_full_test.json \
+  --dataset-root /content/drive/MyDrive/REVIDE_sequences \
+  --output-dir /content/drive/MyDrive/TRDN_REVIDE/paper_artifacts
+
+python scripts/emit_paper_tables.py \
+  --eval-json /content/drive/MyDrive/TRDN_REVIDE/evaluate_full_test.json \
+  --output-dir /content/drive/MyDrive/TRDN_REVIDE/paper_artifacts
+```
+
+Metric charts and table values are read only from evaluation JSON. Qualitative
+indices are a seeded draw over the complete test-window index and are recorded
+with every figure sidecar; no quality-based filtering is performed.
 
 ### Diffusion-only baseline (isolating the temporal contribution)
 
