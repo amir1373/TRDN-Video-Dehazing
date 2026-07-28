@@ -7,6 +7,26 @@ dehazing at all, plus several related issues. This change fixes the pipeline
 to measure the intended task, without changing or inventing any previously
 reported numbers.
 
+### Complete RunPod paper workflow
+
+- Added true diffusion-only training: only the inpainting U-Net is constructed,
+  conditioning is text-only, and only diffusion, L1, and LPIPS losses are
+  computed. Added explicit no-RAFT and no-transformer training variants and
+  recorded exact active components and losses in manifests and checkpoints.
+- Added four-variant training smoke coverage and preserved evaluator-owned RAFT
+  temporal metrics for the independently trained diffusion-only baseline.
+- Added detached launch, monitor, list, stop, interrupted-step resume, sibling
+  numerics/seed validation, and periodic log-friendly progress for RunPod jobs.
+- Added the ordered A-Q `TRDN_REVIDE_RunPod.ipynb` workflow, measured benchmark
+  recommendations, explicit numerics locking, sample-accounting evaluation,
+  final bundle validation, and reconnect-safe idempotence.
+- Expanded final paper generation to use one shared seeded sample selection for
+  all runs and produce quantitative, qualitative, cross-run, error-map, zoom,
+  temporal, reference-weight, failure-case, training-curve, and VAE-ceiling
+  figures as PNG and PDF with provenance sidecars.
+- No CUDA timing, memory profiling, or performance measurement was performed
+  locally; CUDA-only benchmark behavior was verified to fail without output.
+
 ### Final paid-run metric and selection fixes
 
 - Separated model RAFT alignment from an evaluator-owned metric RAFT. Every
