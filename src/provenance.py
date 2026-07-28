@@ -156,8 +156,11 @@ def checkpoint_metadata(
     best_psnr: float,
     best_ssim: float,
     run_manifest_path: Path,
+    validation_state: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     state = git_state()
+    validation_state = dict(validation_state or {})
+    selected_value = best_psnr if config.checkpoint_selection_metric == "psnr" else best_ssim
     return {
         "step": int(step),
         "best_psnr": float(best_psnr),
@@ -184,6 +187,27 @@ def checkpoint_metadata(
             "lr_warmup_steps": config.lr_warmup_steps,
             "enable_linear_lr_scaling": config.enable_linear_lr_scaling,
             "lr_reference_batch_size": config.lr_reference_batch_size,
+        },
+        "checkpoint_selection": {
+            "metric": config.checkpoint_selection_metric,
+            "value": float(selected_value) if selected_value >= 0 else None,
+            "checkpoint_name": f"best_{config.checkpoint_selection_metric}",
+            "validation_num_samples": int(validation_state.get("num_samples", 0)),
+            "validation_num_inference_steps": int(
+                validation_state.get(
+                    "num_inference_steps",
+                    config.validation_num_inference_steps,
+                )
+            ),
+            "validation_seed": int(
+                validation_state.get("seed", config.validation_seed)
+            ),
+            "validation_step": validation_state.get("step"),
+            "early_stopping_enabled": config.enable_early_stopping,
+            "early_stopping_patience": config.early_stopping_patience,
+            "early_stopping_bad_validation_count": int(
+                validation_state.get("early_stopping_bad_validation_count", 0)
+            ),
         },
         "checkpoint_retention": {
             "keep_last_n_checkpoints": int(config.keep_last_n_checkpoints),
@@ -374,6 +398,19 @@ def create_run_manifest(
         "trainable_parameters": trainable_parameter_counts(modules, optimizer),
         "environment": runtime_environment(config.mixed_precision),
         "numerics": numerics_settings(config),
+        "checkpoint_selection": {
+            "metric": config.checkpoint_selection_metric,
+            "checkpoint_name": f"best_{config.checkpoint_selection_metric}",
+            "current_value": None,
+            "validation_num_samples_configured": config.validation_num_samples,
+            "validation_num_inference_steps": config.validation_num_inference_steps,
+            "validation_seed": config.validation_seed,
+            "early_stopping_enabled": config.enable_early_stopping,
+            "early_stopping_patience": config.early_stopping_patience,
+            "early_stopping_bad_validation_count": 0,
+            "stopped_early": False,
+        },
+        "validation_passes": [],
         "metrics_log": str((path.parent / "metrics.jsonl").resolve()),
         "evaluations": [],
     }

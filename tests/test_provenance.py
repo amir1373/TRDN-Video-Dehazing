@@ -105,6 +105,18 @@ def test_checkpoint_metadata_records_reproducibility_fields(tmp_path: Path):
     assert metadata["loss_weights"]["flow"] == 0.125
     assert metadata["numerics"] == numerics_settings(config)
     assert metadata["git_commit_sha"]
+    assert metadata["checkpoint_selection"] == {
+        "metric": "psnr",
+        "value": 20.0,
+        "checkpoint_name": "best_psnr",
+        "validation_num_samples": 0,
+        "validation_num_inference_steps": 30,
+        "validation_seed": 1234,
+        "validation_step": None,
+        "early_stopping_enabled": False,
+        "early_stopping_patience": 5,
+        "early_stopping_bad_validation_count": 0,
+    }
 
 
 def test_existing_run_with_different_numerics_is_reported(tmp_path: Path):

@@ -98,8 +98,14 @@ class TRDNConfig:
     validate_every: int = 500
     checkpoint_every: int = 250
     num_inference_steps: int = 30
-    validation_num_inference_steps: int = 10
-    validation_max_batches: int = 4
+    # Checkpoint selection uses this fixed, deterministic validation protocol,
+    # separate from final test evaluation settings.
+    validation_num_samples: int = 32
+    validation_num_inference_steps: int = 30
+    validation_seed: int = 1234
+    checkpoint_selection_metric: Literal["psnr", "ssim"] = "psnr"
+    enable_early_stopping: bool = False
+    early_stopping_patience: int = 5
     guidance_scale: float = 1.0
     text_prompt: str = "a clear clean dehazed video frame"
     enable_ema: bool = False
