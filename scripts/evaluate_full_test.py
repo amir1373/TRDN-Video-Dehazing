@@ -139,7 +139,7 @@ def load_runtime_for_eval(
             Path(checkpoint_path) / "ema_weights.pt",
             allow_module_subset=diffusion_only,
         )
-    raft_model = (
+    model_raft = (
         load_raft(
             device,
             config.freeze_raft,
@@ -155,7 +155,7 @@ def load_runtime_for_eval(
         "temporal_transformer": temporal_transformer,
         "reference_selector": reference_selector,
         "conditioning_adapter": conditioning_adapter,
-        "raft_model": raft_model,
+        "model_raft": model_raft,
         "ema": ema_report,
     }
 
@@ -223,14 +223,15 @@ def evaluate(
     clips_total_found = len(dataset.sequences)
     clips_available = len(by_clip)
     skipped_clips: List[Dict[str, Any]] = [dict(item) for item in dataset.skipped_sequences]
-    consistency_raft = None
-    if not args.diffusion_only:
-        consistency_raft = runtime["raft_model"] or load_raft(
-            device,
-            config.freeze_raft,
-            config.validate_raft_flow,
-            config.raft_max_flow_factor,
-        )
+    # Metric RAFT is evaluator-owned and deliberately independent of the model
+    # path. Even the frame-by-frame diffusion baseline needs the same
+    # motion-compensated temporal metric as every temporal model/ablation.
+    consistency_raft = load_raft(
+        device,
+        True,
+        config.validate_raft_flow,
+        config.raft_max_flow_factor,
+    )
 
     per_clip_results: List[Dict[str, Any]] = []
     all_psnr: List[float] = []
@@ -301,7 +302,7 @@ def evaluate(
                         runtime["reference_selector"],
                         runtime["conditioning_adapter"],
                         device,
-                        raft_model=runtime["raft_model"],
+                        raft_model=runtime["model_raft"],
                         num_steps=args.num_steps,
                         seed=args.seed,
                         sample_ids=sample_ids,
@@ -423,6 +424,10 @@ def evaluate(
         "train_mode": dataset.train_mode,
         "mask_mode": dataset._resolve_mask_mode(),
         "diffusion_only_baseline": args.diffusion_only,
+        "temporal_metric": {
+            "name": "raft_flow_warped_prediction_l1",
+            "metric_raft_is_independent_of_model": True,
+        },
         "ema_weights": runtime["ema"],
         "seed": args.seed,
         "num_inference_steps": args.num_steps,
