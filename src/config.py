@@ -98,6 +98,10 @@ class TRDNConfig:
     w_reference: float = 0.0
 
     resume_from_checkpoint: str = ""
+    allow_mode_mismatch: bool = False
+    keep_last_n_checkpoints: int = 3
+    always_keep_best: bool = True
+    run_name: str = ""
 
     def paths(self) -> dict:
         root = Path(self.project_root)
@@ -132,6 +136,21 @@ class TRDNConfig:
             else:
                 safe[key] = str(value)
         return safe
+
+    def override_dataset_root(self, dataset_root: str) -> None:
+        """Set a dataset root while preserving separate Train/Test directories."""
+        root = Path(dataset_root)
+        self.dataset_root = str(root)
+
+        def split_root(names: Tuple[str, ...]) -> str:
+            for name in names:
+                candidate = root / name
+                if candidate.is_dir():
+                    return str(candidate)
+            return str(root)
+
+        self.train_root = split_root(("Train", "train", "Training", "training"))
+        self.test_root = split_root(("Test", "test", "Testing", "testing"))
 
     def root_for_split(self, split: str) -> str:
         """Resolve a split name to a filesystem root.

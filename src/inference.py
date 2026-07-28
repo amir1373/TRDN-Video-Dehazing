@@ -11,11 +11,14 @@ from .dataset import REVIDESequenceDataset
 from .diffusion_adapter import load_diffusion_backbone
 from .flow import load_raft
 from .losses import LossBundle
+from .provenance import validate_checkpoint_modes
 from .train import build_optimizer, build_temporal_modules
 from .validate import infer_dehazed_batch
 
 
 def load_runtime(config: TRDNConfig, checkpoint_path: str = "") -> Dict[str, Any]:
+    if checkpoint_path:
+        validate_checkpoint_modes(checkpoint_path, config)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     diffusion = load_diffusion_backbone(config, device=device)
     temporal_memory, temporal_transformer, reference_selector, conditioning_adapter = build_temporal_modules(

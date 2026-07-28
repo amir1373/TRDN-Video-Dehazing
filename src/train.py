@@ -25,6 +25,18 @@ from .dataset import REVIDESequenceDataset
 from .diffusion_adapter import estimate_x0_from_epsilon, get_text_embeddings, prepare_inpainting_inputs, decode_latents_to_images, encode_images_to_latents
 from .flow import compute_warped_references_batch, load_raft
 from .losses import LossBundle, weighted_total_loss
+from .provenance import (
+    JsonlMetricLogger,
+    checkpoint_metadata,
+    create_run_manifest,
+    make_run_dir,
+    mean_records,
+    peak_gpu_memory_bytes,
+    prune_step_checkpoints,
+    update_manifest,
+    validate_checkpoint_modes,
+    write_json,
+)
 from .reference_selector import ReferenceSelectionModule
 from .diffusion_adapter import TemporalConditioningAdapter, load_diffusion_backbone
 from .temporal_transformer import TemporalRetrievalTransformer
@@ -75,6 +87,26 @@ def make_dataloaders(config: TRDNConfig) -> Tuple[DataLoader, DataLoader]:
     )
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
     return train_loader, val_loader
+
+
+def make_test_dataset_for_manifest(config: TRDNConfig) -> REVIDESequenceDataset:
+    """Discover test sequences and windows for inventory only.
+
+    No samples are loaded, and synthetic fallback is disabled so the manifest
+    cannot turn an absent test set into a plausible-looking clip count.
+    """
+    return REVIDESequenceDataset(
+        config.root_for_split("test"),
+        split="test",
+        seq_len=config.seq_len,
+        crop_size=config.crop_size,
+        random_crop=False,
+        extensions=config.image_extensions,
+        synthetic_if_empty=False,
+        train_mode=config.train_mode,
+        mask_mode=config.mask_mode,
+        include_prev_frame=False,
+    )
 
 
 def build_temporal_modules(
@@ -181,79 +213,268 @@ def forward_window_prediction(
     }
 
 
-def save_checkpoint(accelerator: Accelerator, checkpoint_dir: Path, step: int, best_psnr: float, best_ssim: float, name: str | None = None) -> None:
+def compute_training_loss(
+    accelerator: Accelerator,
+    diffusion: Dict[str, Any],
+    temporal_memory: torch.nn.Module,
+    temporal_transformer: torch.nn.Module | None,
+    reference_selector: torch.nn.Module,
+    conditioning_adapter: torch.nn.Module,
+    raft_model: torch.nn.Module | None,
+    loss_bundle: LossBundle,
+    batch: Dict[str, Any],
+    config: TRDNConfig,
+    temporal_loss_enabled: bool = True,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    frames = batch["frames"].to(accelerator.device, non_blocking=True)
+    target = batch["target_frame"].to(accelerator.device, non_blocking=True)
+    mask = batch["mask"].to(accelerator.device, non_blocking=True)
+    corrupted = batch["corrupted_frame"].to(accelerator.device, non_blocking=True)
+
+    current_out = forward_window_prediction(
+        accelerator,
+        diffusion,
+        temporal_memory,
+        temporal_transformer,
+        reference_selector,
+        conditioning_adapter,
+        raft_model,
+        frames,
+        mask,
+        corrupted,
+        target,
+        seq_len=config.seq_len,
+    )
+    pred_img = current_out["pred_img"]
+    warped_refs = current_out["warped_refs"]
+    flows = current_out["flows"]
+    current = current_out["current"]
+
+    if not temporal_loss_enabled:
+        temporal_loss = pred_img.new_zeros(())
+    elif config.train_mode == "dehaze" and "prev_frames" in batch:
+        prev_frames = batch["prev_frames"].to(accelerator.device, non_blocking=True)
+        prev_target = batch["prev_target_frame"].to(accelerator.device, non_blocking=True)
+        prev_mask = batch["prev_mask"].to(accelerator.device, non_blocking=True)
+        prev_corrupted = batch["prev_corrupted_frame"].to(accelerator.device, non_blocking=True)
+        with torch.no_grad():
+            prev_out = forward_window_prediction(
+                accelerator,
+                diffusion,
+                temporal_memory,
+                temporal_transformer,
+                reference_selector,
+                conditioning_adapter,
+                raft_model,
+                prev_frames,
+                prev_mask,
+                prev_corrupted,
+                prev_target,
+                seq_len=config.seq_len,
+            )
+        temporal_loss = loss_bundle.predictive_temporal_consistency_loss(
+            pred_img, prev_out["pred_img"], flows[:, -1]
+        )
+    else:
+        temporal_loss = loss_bundle.legacy_temporal_consistency_loss(
+            pred_img, warped_refs, current_out["weights"]
+        )
+
+    with accelerator.autocast():
+        parts = {
+            "diffusion": current_out["diffusion_loss"],
+            "l1": F.l1_loss(pred_img, target),
+            "lpips": loss_bundle.lpips_loss(pred_img, target),
+            "temporal": temporal_loss,
+            "flow": loss_bundle.flow_consistency_loss(
+                warped_refs, current, current_out["weights"]
+            ),
+        }
+        if config.w_reference != 0.0:
+            parts["reference"] = loss_bundle.reference_preservation_loss(
+                pred_img, current_out["weighted_reference"], mask
+            )
+        total_loss = weighted_total_loss(config, parts)
+    return total_loss, parts
+
+
+def save_checkpoint(
+    accelerator: Accelerator,
+    checkpoint_dir: Path,
+    step: int,
+    best_psnr: float,
+    best_ssim: float,
+    config: TRDNConfig,
+    run_manifest_path: Path,
+    name: str | None = None,
+) -> None:
     out_dir = checkpoint_dir / (name or f"step_{step:06d}")
     accelerator.save_state(str(out_dir))
     if accelerator.is_main_process:
-        with open(out_dir / "metadata.json", "w", encoding="utf-8") as handle:
-            json.dump({"step": step, "best_psnr": best_psnr, "best_ssim": best_ssim, "time": time.time()}, handle, indent=2)
+        write_json(
+            out_dir / "metadata.json",
+            checkpoint_metadata(config, step, best_psnr, best_ssim, run_manifest_path),
+        )
+        if name is None:
+            prune_step_checkpoints(
+                checkpoint_dir,
+                config.keep_last_n_checkpoints,
+                config.always_keep_best,
+            )
+
+
+def _step_metric_record(
+    parts: Dict[str, torch.Tensor],
+    total_loss: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    epoch: int,
+) -> Dict[str, Any]:
+    loss_names = ("diffusion", "l1", "lpips", "temporal", "flow", "reference")
+    learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
+    record: Dict[str, Any] = {
+        "event": "step",
+        "step": step,
+        "epoch": epoch,
+        "total_loss": float(total_loss.detach().cpu()),
+        "lr": learning_rates[0],
+        "learning_rates": learning_rates,
+    }
+    for name in loss_names:
+        value = parts.get(name)
+        record[f"loss_{name}"] = float(value.detach().cpu()) if value is not None else None
+    return record
 
 
 def train_trdn(config: TRDNConfig) -> Dict[str, float]:
     paths = config.ensure_dirs()
+    resume_metadata: Dict[str, Any] = {}
+    if config.resume_from_checkpoint:
+        # Validate before model construction and, critically, before weights load.
+        resume_metadata = validate_checkpoint_modes(config.resume_from_checkpoint, config)
+
+    run_dir = make_run_dir(Path(paths["logs"]), config.run_name)
+    manifest_path = run_dir / "run_manifest.json"
+    metric_logger = JsonlMetricLogger(run_dir / "metrics.jsonl")
+    started = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         log_with="tensorboard",
-        project_dir=str(paths["logs"]),
+        project_dir=str(run_dir),
     )
-    # Some Colab/TensorBoard builds reject otherwise valid hparam values.
-    # Keep tracker startup robust and persist the full config as JSON instead.
     accelerator.init_trackers("TRDN_REVIDE")
     if accelerator.is_main_process:
-        with open(paths["logs"] / "config.json", "w", encoding="utf-8") as handle:
-            json.dump(config.to_dict(), handle, indent=2, default=str)
+        write_json(run_dir / "config.json", config.to_dict())
 
     diffusion = load_diffusion_backbone(config, device=device)
     temporal_memory, temporal_transformer, reference_selector, conditioning_adapter = build_temporal_modules(
         config, diffusion["unet"].config.cross_attention_dim, device
     )
     loss_bundle = LossBundle(device=device)
-    optimizer = build_optimizer(config, diffusion["unet"], temporal_memory, temporal_transformer, reference_selector, conditioning_adapter)
+    optimizer = build_optimizer(
+        config,
+        diffusion["unet"],
+        temporal_memory,
+        temporal_transformer,
+        reference_selector,
+        conditioning_adapter,
+    )
     train_loader, val_loader = make_dataloaders(config)
+    test_dataset = make_test_dataset_for_manifest(config)
     raft_model = load_raft(device, config.freeze_raft) if config.use_raft_alignment and torch.cuda.is_available() else None
 
+    modules = {
+        "unet": diffusion["unet"],
+        "temporal_memory": temporal_memory,
+        "temporal_transformer": temporal_transformer,
+        "reference_selector": reference_selector,
+        "conditioning_adapter": conditioning_adapter,
+    }
+    if accelerator.is_main_process:
+        manifest = create_run_manifest(
+            manifest_path,
+            config,
+            {
+                "train": train_loader.dataset,
+                "val": val_loader.dataset,
+                "test": test_dataset,
+            },
+            modules,
+            optimizer,
+        )
+        print("TRDN RUN MANIFEST")
+        print(json.dumps(manifest, indent=2, sort_keys=True, default=str))
+
     if temporal_transformer is not None:
-        diffusion["unet"], temporal_memory, temporal_transformer, reference_selector, conditioning_adapter, optimizer, train_loader = accelerator.prepare(
-            diffusion["unet"], temporal_memory, temporal_transformer, reference_selector, conditioning_adapter, optimizer, train_loader
+        (
+            diffusion["unet"],
+            temporal_memory,
+            temporal_transformer,
+            reference_selector,
+            conditioning_adapter,
+            optimizer,
+            train_loader,
+        ) = accelerator.prepare(
+            diffusion["unet"],
+            temporal_memory,
+            temporal_transformer,
+            reference_selector,
+            conditioning_adapter,
+            optimizer,
+            train_loader,
         )
     else:
-        diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer, train_loader = accelerator.prepare(
-            diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer, train_loader
+        (
+            diffusion["unet"],
+            temporal_memory,
+            reference_selector,
+            conditioning_adapter,
+            optimizer,
+            train_loader,
+        ) = accelerator.prepare(
+            diffusion["unet"],
+            temporal_memory,
+            reference_selector,
+            conditioning_adapter,
+            optimizer,
+            train_loader,
         )
     diffusion["vae"].to(accelerator.device)
     diffusion["text_encoder"].to(accelerator.device)
     if raft_model is not None:
         raft_model.to(accelerator.device).eval()
 
-    global_step, best_psnr, best_ssim = 0, -1.0, -1.0
+    global_step = int(resume_metadata.get("step", 0))
+    best_psnr = float(resume_metadata.get("best_psnr", -1.0))
+    best_ssim = float(resume_metadata.get("best_ssim", -1.0))
     if config.resume_from_checkpoint:
         accelerator.load_state(config.resume_from_checkpoint)
-        metadata_path = Path(config.resume_from_checkpoint) / "metadata.json"
-        if metadata_path.exists():
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            global_step = int(metadata.get("step", 0))
-            best_psnr = float(metadata.get("best_psnr", -1.0))
-            best_ssim = float(metadata.get("best_ssim", -1.0))
 
     target_train_steps = (
         config.max_train_steps
         if config.max_train_steps and config.max_train_steps > 0
         else config.num_epochs * len(train_loader)
     )
-    progress = tqdm(total=target_train_steps, initial=global_step, disable=not accelerator.is_main_process, desc="Training TRDN")
-    for _epoch in range(config.num_epochs):
+    progress = tqdm(
+        total=target_train_steps,
+        initial=global_step,
+        disable=not accelerator.is_main_process,
+        desc="Training TRDN",
+    )
+    for epoch_index in range(config.num_epochs):
+        epoch = epoch_index + 1
+        epoch_records = []
+        epoch_validation: Dict[str, float] = {}
         for batch in train_loader:
             if global_step >= target_train_steps:
                 break
             with accelerator.accumulate(diffusion["unet"]):
-                frames = batch["frames"].to(accelerator.device, non_blocking=True)
-                target = batch["target_frame"].to(accelerator.device, non_blocking=True)
-                mask = batch["mask"].to(accelerator.device, non_blocking=True)
-                corrupted = batch["corrupted_frame"].to(accelerator.device, non_blocking=True)
-
-                current_out = forward_window_prediction(
+                total_loss, parts = compute_training_loss(
                     accelerator,
                     diffusion,
                     temporal_memory,
@@ -261,63 +482,10 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     reference_selector,
                     conditioning_adapter,
                     raft_model,
-                    frames,
-                    mask,
-                    corrupted,
-                    target,
-                    seq_len=config.seq_len,
+                    loss_bundle,
+                    batch,
+                    config,
                 )
-                pred_img = current_out["pred_img"]
-                warped_refs = current_out["warped_refs"]
-                flows = current_out["flows"]
-                current = current_out["current"]
-
-                if config.train_mode == "dehaze" and "prev_frames" in batch:
-                    # Extra no-grad pass on the previous frame's window to get a
-                    # genuine predicted t-1 frame, used only as a detached anchor
-                    # for predictive_temporal_consistency_loss below.
-                    prev_frames = batch["prev_frames"].to(accelerator.device, non_blocking=True)
-                    prev_target = batch["prev_target_frame"].to(accelerator.device, non_blocking=True)
-                    prev_mask = batch["prev_mask"].to(accelerator.device, non_blocking=True)
-                    prev_corrupted = batch["prev_corrupted_frame"].to(accelerator.device, non_blocking=True)
-                    with torch.no_grad():
-                        prev_out = forward_window_prediction(
-                            accelerator,
-                            diffusion,
-                            temporal_memory,
-                            temporal_transformer,
-                            reference_selector,
-                            conditioning_adapter,
-                            raft_model,
-                            prev_frames,
-                            prev_mask,
-                            prev_corrupted,
-                            prev_target,
-                            seq_len=config.seq_len,
-                        )
-                    # flows[:, -1] is the RAFT flow from frames[:, -2] (=t-1) to
-                    # frames[:, -1] (=t) -- the same physical frame that
-                    # prev_out["pred_img"] predicts, so it is the correct flow
-                    # to warp the previous prediction into the current frame.
-                    temporal_loss = loss_bundle.predictive_temporal_consistency_loss(
-                        pred_img, prev_out["pred_img"], flows[:, -1]
-                    )
-                else:
-                    temporal_loss = loss_bundle.legacy_temporal_consistency_loss(pred_img, warped_refs, current_out["weights"])
-
-                with accelerator.autocast():
-                    parts = {
-                        "diffusion": current_out["diffusion_loss"],
-                        "l1": F.l1_loss(pred_img, target),
-                        "lpips": loss_bundle.lpips_loss(pred_img, target),
-                        "temporal": temporal_loss,
-                        "flow": loss_bundle.flow_consistency_loss(warped_refs, current, current_out["weights"]),
-                    }
-                    if config.w_reference != 0.0:
-                        parts["reference"] = loss_bundle.reference_preservation_loss(
-                            pred_img, current_out["weighted_reference"], mask
-                        )
-                    total_loss = weighted_total_loss(config, parts)
                 accelerator.backward(total_loss)
                 grad_norm = None
                 if accelerator.sync_gradients:
@@ -332,15 +500,28 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            if accelerator.is_main_process and global_step % config.log_every == 0:
-                logs = {f"train/{key}_loss": float(value.detach().cpu()) for key, value in parts.items()}
-                logs["train/total_loss"] = float(total_loss.detach().cpu())
-                if grad_norm is not None:
-                    logs["train/grad_norm"] = float(grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm)
-                accelerator.log(logs, step=global_step)
-                progress.set_postfix({"loss": logs["train/total_loss"]})
+            global_step += 1
+            progress.update(1)
+            step_record = _step_metric_record(parts, total_loss, optimizer, global_step, epoch)
+            epoch_records.append(step_record)
+            if accelerator.is_main_process:
+                metric_logger.append(step_record)
 
-            if global_step > 0 and global_step % config.validate_every == 0:
+            if accelerator.is_main_process and global_step % config.log_every == 0:
+                tracker_logs = {
+                    f"train/{key.removeprefix('loss_')}_loss": value
+                    for key, value in step_record.items()
+                    if key.startswith("loss_") and value is not None
+                }
+                tracker_logs["train/total_loss"] = step_record["total_loss"]
+                if grad_norm is not None:
+                    tracker_logs["train/grad_norm"] = float(
+                        grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm
+                    )
+                accelerator.log(tracker_logs, step=global_step)
+                progress.set_postfix({"loss": step_record["total_loss"]})
+
+            if global_step % config.validate_every == 0:
                 metrics = validate_trdn(
                     val_loader,
                     diffusion,
@@ -354,27 +535,111 @@ def train_trdn(config: TRDNConfig) -> Dict[str, float]:
                     max_batches=4,
                     num_steps=min(10, config.num_inference_steps),
                 )
-                scalar_metrics = {key: value for key, value in metrics.items() if isinstance(value, float)}
-                accelerator.log({f"val/{key}": value for key, value in scalar_metrics.items()}, step=global_step)
-                if scalar_metrics["psnr"] > best_psnr:
-                    best_psnr = scalar_metrics["psnr"]
-                    save_checkpoint(accelerator, paths["checkpoints"], global_step, best_psnr, best_ssim, "best_psnr")
-                if scalar_metrics["ssim"] > best_ssim:
-                    best_ssim = scalar_metrics["ssim"]
-                    save_checkpoint(accelerator, paths["checkpoints"], global_step, best_psnr, best_ssim, "best_ssim")
+                epoch_validation = {
+                    key: float(value)
+                    for key, value in metrics.items()
+                    if isinstance(value, (int, float))
+                }
+                accelerator.log(
+                    {f"val/{key}": value for key, value in epoch_validation.items()},
+                    step=global_step,
+                )
+                if accelerator.is_main_process:
+                    metric_logger.append(
+                        {
+                            "event": "validation",
+                            "step": global_step,
+                            "epoch": epoch,
+                            **{f"val_{key}": value for key, value in epoch_validation.items()},
+                        }
+                    )
+                if epoch_validation["psnr"] > best_psnr:
+                    best_psnr = epoch_validation["psnr"]
+                    save_checkpoint(
+                        accelerator,
+                        Path(paths["checkpoints"]),
+                        global_step,
+                        best_psnr,
+                        best_ssim,
+                        config,
+                        manifest_path,
+                        "best_psnr",
+                    )
+                if epoch_validation["ssim"] > best_ssim:
+                    best_ssim = epoch_validation["ssim"]
+                    save_checkpoint(
+                        accelerator,
+                        Path(paths["checkpoints"]),
+                        global_step,
+                        best_psnr,
+                        best_ssim,
+                        config,
+                        manifest_path,
+                        "best_ssim",
+                    )
 
-            if global_step > 0 and global_step % config.checkpoint_every == 0:
-                save_checkpoint(accelerator, paths["checkpoints"], global_step, best_psnr, best_ssim)
+            if global_step % config.checkpoint_every == 0:
+                save_checkpoint(
+                    accelerator,
+                    Path(paths["checkpoints"]),
+                    global_step,
+                    best_psnr,
+                    best_ssim,
+                    config,
+                    manifest_path,
+                )
 
-            global_step += 1
-            progress.update(1)
+        if accelerator.is_main_process and epoch_records:
+            aggregate_keys = [
+                "loss_diffusion",
+                "loss_l1",
+                "loss_lpips",
+                "loss_temporal",
+                "loss_flow",
+                "loss_reference",
+                "total_loss",
+                "lr",
+            ]
+            metric_logger.append(
+                {
+                    "event": "epoch",
+                    "step": global_step,
+                    "epoch": epoch,
+                    **mean_records(epoch_records, aggregate_keys),
+                    **{f"val_{key}": value for key, value in epoch_validation.items()},
+                }
+            )
         if global_step >= target_train_steps:
             break
 
-    save_checkpoint(accelerator, paths["checkpoints"], global_step, best_psnr, best_ssim, "last")
+    save_checkpoint(
+        accelerator,
+        Path(paths["checkpoints"]),
+        global_step,
+        best_psnr,
+        best_ssim,
+        config,
+        manifest_path,
+        "last",
+    )
+    elapsed_seconds = time.perf_counter() - started
+    result = {"step": float(global_step), "best_psnr": best_psnr, "best_ssim": best_ssim}
+    if accelerator.is_main_process:
+        update_manifest(
+            manifest_path,
+            {
+                "status": "completed",
+                "finished_at_unix": time.time(),
+                "training": {
+                    "wall_clock_seconds": elapsed_seconds,
+                    "peak_gpu_memory_bytes": peak_gpu_memory_bytes(),
+                    "result": result,
+                },
+            },
+        )
     accelerator.end_training()
     progress.close()
-    return {"step": float(global_step), "best_psnr": best_psnr, "best_ssim": best_ssim}
+    return result
 
 
 def _run_temporal_stack(frames: torch.Tensor, seq_len: int, device: str) -> Dict[str, Any]:
