@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import random
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +23,21 @@ TRAIN_MODES = {"dehaze", "reconstruct_synthetic"}
 _LEGACY_TRAIN_MODE_ALIASES = {"reconstruct": "reconstruct_synthetic"}
 
 logger = logging.getLogger(__name__)
+_NATURAL_PARTS = re.compile(r"(\d+)")
+_STEM_TOKENS = re.compile(r"[a-z]+|\d+")
+_MODALITY_TOKENS = {
+    "clean",
+    "clear",
+    "degraded",
+    "fog",
+    "ground",
+    "groundtruth",
+    "gt",
+    "hazy",
+    "input",
+    "target",
+    "truth",
+}
 
 
 def _normalize_train_mode(train_mode: str) -> str:
@@ -45,10 +61,83 @@ def image_to_tensor(path: Path) -> torch.Tensor:
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
 
+def natural_sort_key(value: str | Path) -> tuple:
+    """Case-insensitive natural key, so frame_2 sorts before frame_10."""
+    text = Path(value).name if isinstance(value, Path) else str(value)
+    parts = tuple(
+        (1, int(part)) if part.isdigit() else (0, part.casefold())
+        for part in _NATURAL_PARTS.split(text)
+        if part
+    )
+    return (*parts, (2, text.casefold()))
+
+
+def _normalized_frame_stem(path: Path) -> tuple:
+    tokens = _STEM_TOKENS.findall(path.stem.casefold())
+    normalized = [
+        int(token) if token.isdigit() else token
+        for token in tokens
+        if token not in _MODALITY_TOKENS
+    ]
+    return tuple(normalized)
+
+
+def frame_pairing_report(
+    hazy_files: List[Path],
+    clean_files: List[Path],
+    *,
+    sample_size: int = 5,
+) -> Dict[str, Any]:
+    """Validate natural-position pairing using exact or modality-normalized stems.
+
+    Files are natural-sorted first. Each positional pair must then have either
+    the same case-insensitive stem, or the same token sequence after removing
+    only documented modality tokens (for example ``hazy_2`` and ``clean_2``).
+    """
+    pairs = list(zip(hazy_files, clean_files))
+    exact_matches = [
+        hazy.stem.casefold() == clean.stem.casefold()
+        for hazy, clean in pairs
+    ]
+    normalized_matches = [
+        bool(_normalized_frame_stem(hazy))
+        and _normalized_frame_stem(hazy) == _normalized_frame_stem(clean)
+        for hazy, clean in pairs
+    ]
+    consistent = (
+        len(hazy_files) == len(clean_files)
+        and all(exact or normalized for exact, normalized in zip(exact_matches, normalized_matches))
+    )
+    differing_pairs = [
+        {
+            "hazy": hazy.name,
+            "clean": clean.name,
+            "hazy_normalized_stem": list(_normalized_frame_stem(hazy)),
+            "clean_normalized_stem": list(_normalized_frame_stem(clean)),
+        }
+        for (hazy, clean), exact in zip(pairs, exact_matches)
+        if not exact
+    ]
+    return {
+        "rule": "natural_sort_then_exact_or_known_modality_normalized_stem",
+        "consistent": consistent,
+        "exact_stems": bool(pairs) and all(exact_matches),
+        "inference_used": bool(differing_pairs),
+        "sample_inferred_pairs": differing_pairs[:sample_size],
+    }
+
+
 def list_images(folder: Path, extensions: Tuple[str, ...]) -> List[Path]:
     if not folder.exists():
         return []
-    return sorted(path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in extensions)
+    return sorted(
+        (
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in extensions
+        ),
+        key=natural_sort_key,
+    )
 
 
 def discover_revide_sequences(root: Path, split: Optional[str], extensions: Tuple[str, ...]) -> List[Dict[str, Any]]:
@@ -215,6 +304,20 @@ class REVIDESequenceDataset(Dataset):
                     }
                 )
                 continue
+            pairing = frame_pairing_report(
+                sequence["hazy_files"],
+                sequence["clean_files"],
+            )
+            sequence["pairing_report"] = pairing
+            if not pairing["consistent"]:
+                self.skipped_sequences.append(
+                    {
+                        "sequence_name": sequence["name"],
+                        "reason": "frame_pairing_mismatch",
+                        "pairing_report": pairing,
+                    }
+                )
+                continue
             count = hazy_count
             if count < min_window:
                 self.skipped_sequences.append(
@@ -239,6 +342,10 @@ class REVIDESequenceDataset(Dataset):
         sequences = []
         for sequence in self.sequences:
             status = skipped.get(sequence["name"])
+            pairing = sequence.get("pairing_report") or frame_pairing_report(
+                sequence["hazy_files"],
+                sequence["clean_files"],
+            )
             sequences.append(
                 {
                     "sequence_name": sequence["name"],
@@ -246,7 +353,7 @@ class REVIDESequenceDataset(Dataset):
                     "clean_dir": str(sequence["clean_dir"]),
                     "hazy_frames": len(sequence["hazy_files"]),
                     "clean_frames": len(sequence["clean_files"]),
-                    "pairing": "sorted_position",
+                    "pairing": pairing,
                     "status": "skipped" if status else "eligible",
                     "reason": status.get("reason") if status else None,
                 }
@@ -277,6 +384,25 @@ class REVIDESequenceDataset(Dataset):
             )
             raise RuntimeError(
                 f"{split} dataset structure mismatch: hazy/clean frame counts differ: {details}"
+            )
+        pairing_mismatches = [
+            item
+            for item in self.skipped_sequences
+            if item["reason"] == "frame_pairing_mismatch"
+        ]
+        if pairing_mismatches:
+            raise RuntimeError(
+                f"{split} dataset frame pairing mismatch under the documented natural-sort "
+                "and stem-normalization rule. Inferred sample pairs: "
+                + str(
+                    [
+                        {
+                            "sequence_name": item["sequence_name"],
+                            **item["pairing_report"],
+                        }
+                        for item in pairing_mismatches[:5]
+                    ]
+                )
             )
         if not self.index:
             shortest = "; ".join(

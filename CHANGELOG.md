@@ -7,6 +7,22 @@ dehazing at all, plus several related issues. This change fixes the pipeline
 to measure the intended task, without changing or inventing any previously
 reported numbers.
 
+### Final paid-run metric and selection fixes
+
+- Separated model RAFT alignment from an evaluator-owned metric RAFT. Every
+  variant, including diffusion-only, now reports the same flow-warped temporal
+  consistency metric while the baseline model path remains entirely temporal-free.
+- Replaced the 4-batch/10-step checkpoint-selection proxy with explicit
+  deterministic defaults of up to 32 validation samples and 30 DDIM steps.
+  The selected metric defaults to PSNR and is configurable; manifests and
+  checkpoints record the metric/value, actual sample count, steps, seed, and
+  measured per-pass work/cost. Default-off early stopping now supports a
+  configurable patience.
+- Added natural filename sorting and documented stem correspondence checks.
+  Preflight prints inferred differing-stem pairs and rejects inconsistent
+  frame ordering before training.
+- No GPU work or performance measurement was performed for these changes.
+
 ### Paid-run readiness final pass
 
 - Added a CPU-only end-to-end smoke pipeline covering preflight, training,
