@@ -247,6 +247,7 @@ class REVIDESequenceDataset(Dataset):
         val_fraction: float = 0.1,
         split_seed: int = 1234,
         include_prev_frame: bool = True,
+        include_reference_frames: bool = True,
     ):
         self.root = Path(root)
         self.split = split
@@ -277,6 +278,11 @@ class REVIDESequenceDataset(Dataset):
         # predictions (not needed at training time) can pass
         # include_prev_frame=False to skip the extra I/O.
         self.needs_prev_frame = self.train_mode == "dehaze" and include_prev_frame
+        self.include_reference_frames = include_reference_frames
+        if self.needs_prev_frame and not self.include_reference_frames:
+            raise ValueError(
+                "Previous-prediction windows require reference-frame loading."
+            )
 
         self.sequences = discover_revide_sequences(self.root, split, extensions)
         if max_sequences is not None:
@@ -467,6 +473,9 @@ class REVIDESequenceDataset(Dataset):
         ext_start = start_idx - 1 if self.needs_prev_frame else start_idx
         hazy_paths_ext = sequence["hazy_files"][ext_start : end_idx + 1]
         clean_paths_ext = sequence["clean_files"][ext_start : end_idx + 1]
+        if not self.include_reference_frames:
+            hazy_paths_ext = hazy_paths_ext[-1:]
+            clean_paths_ext = clean_paths_ext[-1:]
         hazy_ext = torch.stack([image_to_tensor(path) for path in hazy_paths_ext], dim=0)
         clean_ext = torch.stack([image_to_tensor(path) for path in clean_paths_ext], dim=0)
 
@@ -483,7 +492,13 @@ class REVIDESequenceDataset(Dataset):
 
     def _load_synthetic_clip(self, idx: int) -> Dict[str, Any]:
         height = width = max(self.crop_size, 256)
-        total_len = self.seq_len + 1 if self.needs_prev_frame else self.seq_len
+        total_len = (
+            self.seq_len + 1
+            if self.needs_prev_frame
+            else self.seq_len
+            if self.include_reference_frames
+            else 1
+        )
         yy, xx = torch.meshgrid(torch.linspace(0, 1, height), torch.linspace(0, 1, width), indexing="ij")
         clean_frames_ext = []
         for tidx in range(total_len):

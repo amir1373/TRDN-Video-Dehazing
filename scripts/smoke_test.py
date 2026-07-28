@@ -62,6 +62,8 @@ def tiny_backbone(_config, device="cpu"):
 
 
 def tiny_temporal(config, _cross_attention_dim, device):
+    if config.model_variant == "diffusion_only":
+        return None, None, None, None
     modules = [TinyModule().to(device) for _ in range(4)]
     return modules[0], (modules[1] if config.use_temporal_transformer else None), modules[2], modules[3]
 
@@ -282,25 +284,110 @@ def run_smoke(work_root: Path) -> dict:
         resume_config.resume_from_checkpoint = str(checkpoint)
         resumed_result = train_module.train_trdn(resume_config)
 
+        ablation_checkpoints = {}
+        for model_variant in ("no_raft", "no_transformer", "diffusion_only"):
+            ablation_root = work_root / f"run_{model_variant}"
+            ablation_config = TRDNConfig(
+                project_root=str(ablation_root),
+                mixed_precision="no",
+                model_variant=model_variant,
+                seq_len=2,
+                crop_size=16,
+                batch_size=1,
+                num_workers=0,
+                max_train_steps=2,
+                num_epochs=1,
+                validate_every=99,
+                checkpoint_every=1,
+                log_every=1,
+                num_inference_steps=1,
+                validation_num_samples=2,
+                validation_num_inference_steps=1,
+                run_name=model_variant,
+            )
+            ablation_config.override_dataset_root(str(dataset_root))
+            train_module.train_trdn(ablation_config)
+            ablation_checkpoint = ablation_root / "checkpoints" / "last"
+            _assert_nonempty(ablation_checkpoint / "metadata.json")
+            ablation_manifest = json.loads(
+                (
+                    ablation_root
+                    / "logs"
+                    / "runs"
+                    / model_variant
+                    / "run_manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            if ablation_manifest["model_variant"]["name"] != model_variant:
+                raise AssertionError(f"Wrong manifest variant for {model_variant}.")
+            ablation_checkpoints[model_variant] = str(ablation_checkpoint.resolve())
+
         eval_paths = []
-        for diffusion_only, name in ((False, "full"), (True, "diffusion_only")):
+        evaluation_specs = [
+            ("full", checkpoint, resume_config),
+            (
+                "no_raft",
+                Path(ablation_checkpoints["no_raft"]),
+                TRDNConfig(**resume_config.to_dict()),
+            ),
+            (
+                "no_transformer",
+                Path(ablation_checkpoints["no_transformer"]),
+                TRDNConfig(**resume_config.to_dict()),
+            ),
+            (
+                "diffusion_only",
+                Path(ablation_checkpoints["diffusion_only"]),
+                TRDNConfig(**resume_config.to_dict()),
+            ),
+        ]
+        for name, variant_checkpoint, eval_config in evaluation_specs:
+            eval_config.model_variant = name
+            eval_config.apply_model_variant()
             eval_args = argparse.Namespace(
-                checkpoint=str(checkpoint),
+                checkpoint=str(variant_checkpoint),
                 crop_size=16,
                 train_mode="dehaze",
                 mask_mode="auto",
-                diffusion_only=diffusion_only,
+                diffusion_only=name == "diffusion_only",
                 num_steps=1,
                 seed=1234,
                 variant=name,
                 use_ema=False,
             )
-            report = evaluate_script.evaluate(resume_config, eval_args, "cpu")
+            report = evaluate_script.evaluate(eval_config, eval_args, "cpu")
             output = project_root / "evaluation" / f"{name}.json"
             write_json(output, report)
-            evaluate_script.record_evaluation_manifest(str(checkpoint), output, report)
+            evaluate_script.record_evaluation_manifest(
+                str(variant_checkpoint),
+                output,
+                report,
+            )
             eval_paths.append(output)
 
+        vae_ceiling_path = project_root / "vae_ceiling.json"
+        write_json(
+            vae_ceiling_path,
+            {
+                "aggregate": {
+                    "psnr": {"mean": 40.0},
+                    "ssim": {"mean": 0.99},
+                    "lpips": {"mean": 0.01},
+                }
+            },
+        )
+        metric_logs = [
+            project_root / "logs" / "runs" / "smoke" / "metrics.jsonl",
+            *[
+                work_root
+                / f"run_{variant}"
+                / "logs"
+                / "runs"
+                / variant
+                / "metrics.jsonl"
+                for variant in ("no_raft", "no_transformer", "diffusion_only")
+            ],
+        ]
         figure_args = figures_script.build_parser().parse_args(
             [
                 "--checkpoint",
@@ -315,6 +402,10 @@ def run_smoke(work_root: Path) -> dict:
                 "1234",
                 "--num-samples",
                 "1",
+                "--metric-log",
+                *(str(path) for path in metric_logs),
+                "--vae-ceiling-json",
+                str(vae_ceiling_path),
             ]
         )
         figures_script.run(figure_args)
@@ -339,11 +430,24 @@ def run_smoke(work_root: Path) -> dict:
         artifact_root / "temporal_window_comparison.sidecar.json",
         artifact_root / "reference_weights.png",
         artifact_root / "reference_weights.sidecar.json",
-        artifact_root / "sample_selection.json",
         artifact_root / "qualitative_grid.png",
         artifact_root / "qualitative_grid.sidecar.json",
         artifact_root / "variant_qualitative_comparison.png",
         artifact_root / "variant_qualitative_comparison.sidecar.json",
+        artifact_root / "shared_sample_error_maps.png",
+        artifact_root / "shared_sample_error_maps.sidecar.json",
+        artifact_root / "shared_sample_zoomed_crops.png",
+        artifact_root / "shared_sample_zoomed_crops.sidecar.json",
+        artifact_root / "temporal_consistency_visual.png",
+        artifact_root / "temporal_consistency_visual.sidecar.json",
+        artifact_root / "failure_cases.png",
+        artifact_root / "failure_cases.sidecar.json",
+        artifact_root / "training_curves.png",
+        artifact_root / "training_curves.sidecar.json",
+        artifact_root / "vae_ceiling_reference.png",
+        artifact_root / "vae_ceiling_reference.sidecar.json",
+        artifact_root / "shared_sample_selection.json",
+        artifact_root / "figure_checklist.json",
         markdown_path,
         csv_path,
     ]
@@ -351,6 +455,7 @@ def run_smoke(work_root: Path) -> dict:
         _assert_nonempty(path)
     for figure_path in artifact_root.glob("*.png"):
         _assert_nonempty(figure_path.with_suffix(".sidecar.json"))
+        _assert_nonempty(figure_path.with_suffix(".pdf"))
 
     metrics = [
         json.loads(line)
@@ -387,7 +492,7 @@ def run_smoke(work_root: Path) -> dict:
         raise AssertionError("Smoke evaluation clip accounting is incorrect.")
     if full_report["skipped_clips"][0]["reason"] != "too_short_for_seq_len":
         raise AssertionError("Too-short sequence was not reported with the expected reason.")
-    diffusion_report = json.loads(eval_paths[1].read_text(encoding="utf-8"))
+    diffusion_report = json.loads(eval_paths[3].read_text(encoding="utf-8"))
     if diffusion_report["aggregate"]["temporal_consistency_l1"]["mean"] is None:
         raise AssertionError(
             "Diffusion-only baseline did not report the evaluator-owned temporal metric."
@@ -403,6 +508,7 @@ def run_smoke(work_root: Path) -> dict:
             key: full_report[key]
             for key in ("clips_total_found", "clips_evaluated", "clips_skipped")
         },
+        "ablation_checkpoints": ablation_checkpoints,
     }
 
 

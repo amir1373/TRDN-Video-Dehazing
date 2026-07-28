@@ -224,10 +224,10 @@ def infer_diffusion_only_batch(
 def validate_trdn(
     val_loader,
     diffusion: Dict[str, Any],
-    temporal_memory: torch.nn.Module,
+    temporal_memory: torch.nn.Module | None,
     temporal_transformer: torch.nn.Module | None,
-    reference_selector: torch.nn.Module,
-    conditioning_adapter: torch.nn.Module,
+    reference_selector: torch.nn.Module | None,
+    conditioning_adapter: torch.nn.Module | None,
     loss_bundle: torch.nn.Module,
     device: str,
     raft_model: torch.nn.Module | None = None,
@@ -236,6 +236,7 @@ def validate_trdn(
     seed: Optional[int] = DEFAULT_EVAL_SEED,
     text_prompt: str = "a clear clean dehazed video frame",
     guidance_scale: float = 1.0,
+    diffusion_only: bool = False,
 ) -> Dict[str, Any]:
     if num_samples <= 0:
         raise ValueError(f"Validation num_samples must be positive, got {num_samples}.")
@@ -243,11 +244,14 @@ def validate_trdn(
         raise ValueError(f"Validation num_steps must be positive, got {num_steps}.")
     started = time.perf_counter()
     diffusion["unet"].eval()
-    temporal_memory.eval()
+    if temporal_memory is not None:
+        temporal_memory.eval()
     if temporal_transformer is not None:
         temporal_transformer.eval()
-    reference_selector.eval()
-    conditioning_adapter.eval()
+    if reference_selector is not None:
+        reference_selector.eval()
+    if conditioning_adapter is not None:
+        conditioning_adapter.eval()
     psnrs, ssims, lpips_values = [], [], []
     first_output = None
     validation_total = min(len(val_loader.dataset), num_samples)
@@ -274,24 +278,40 @@ def validate_trdn(
             f"{sequence_names[index]}:{evaluated_samples + index}"
             for index in range(take)
         ]
-        output = infer_dehazed_batch(
-            frames,
-            mask,
-            corrupted,
-            diffusion,
-            temporal_memory,
-            temporal_transformer,
-            reference_selector,
-            conditioning_adapter,
-            device,
-            raft_model=raft_model,
-            num_steps=num_steps,
-            seed=seed,
-            sample_ids=sample_ids,
-            show_progress=False,
-            text_prompt=text_prompt,
-            guidance_scale=guidance_scale,
-        )
+        if diffusion_only:
+            output = infer_diffusion_only_batch(
+                mask,
+                corrupted,
+                diffusion,
+                device,
+                num_steps=num_steps,
+                seed=seed,
+                sample_ids=sample_ids,
+                show_progress=False,
+                text_prompt=text_prompt,
+                guidance_scale=guidance_scale,
+            )
+        else:
+            if temporal_memory is None or reference_selector is None or conditioning_adapter is None:
+                raise RuntimeError("Temporal validation requires temporal modules.")
+            output = infer_dehazed_batch(
+                frames,
+                mask,
+                corrupted,
+                diffusion,
+                temporal_memory,
+                temporal_transformer,
+                reference_selector,
+                conditioning_adapter,
+                device,
+                raft_model=raft_model,
+                num_steps=num_steps,
+                seed=seed,
+                sample_ids=sample_ids,
+                show_progress=False,
+                text_prompt=text_prompt,
+                guidance_scale=guidance_scale,
+            )
         pred = output["prediction"]
         for sample_index in range(take):
             sample_prediction = pred[sample_index : sample_index + 1]
@@ -314,11 +334,14 @@ def validate_trdn(
     progress.close()
 
     diffusion["unet"].train()
-    temporal_memory.train()
+    if temporal_memory is not None:
+        temporal_memory.train()
     if temporal_transformer is not None:
         temporal_transformer.train()
-    reference_selector.train()
-    conditioning_adapter.train()
+    if reference_selector is not None:
+        reference_selector.train()
+    if conditioning_adapter is not None:
+        conditioning_adapter.train()
     return {
         "psnr": float(np.mean(psnrs)) if psnrs else 0.0,
         "ssim": float(np.mean(ssims)) if ssims else 0.0,

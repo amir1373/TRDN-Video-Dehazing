@@ -2,6 +2,9 @@ import csv
 import json
 from pathlib import Path
 
+import torch
+
+import scripts.make_paper_figures as figures
 from scripts.emit_paper_tables import best_rows, load_reports, render_markdown, write_csv
 from scripts.make_paper_figures import (
     generate_metric_figures,
@@ -90,3 +93,36 @@ def test_figure_selection_and_sidecars_are_byte_identical(tmp_path: Path):
     assert json.loads((tmp_path / "run_a" / "reference_weights.json").read_text())[
         "variants"
     ][0]["weights"][0]["mean"] == 0.4
+
+
+def test_qualitative_comparison_loads_each_report_checkpoint(tmp_path, monkeypatch):
+    reports = []
+    expected = []
+    for variant in figures.VARIANT_ORDER:
+        checkpoint = tmp_path / variant
+        checkpoint.mkdir()
+        report = _eval_report(variant, 30.0, 0.1, 1.0)
+        report["checkpoint_path"] = str(checkpoint)
+        reports.append(report)
+        expected.append(checkpoint)
+    observed = []
+
+    def fake_predict(_report, checkpoint, _dataset_root, indices, _seed):
+        observed.append(checkpoint)
+        image = torch.zeros(1, 3, 24, 24)
+        return {
+            index: {"hazy": image, "prediction": image, "target": image}
+            for index in indices
+        }
+
+    monkeypatch.setattr(figures, "_predict_selected", fake_predict)
+    figures.generate_qualitative_figures(
+        reports,
+        [tmp_path / f"{variant}.json" for variant in figures.VARIANT_ORDER],
+        expected[-1],
+        str(tmp_path),
+        tmp_path / "figures",
+        1234,
+        [0],
+    )
+    assert observed == expected

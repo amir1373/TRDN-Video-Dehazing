@@ -42,6 +42,11 @@ SELECTION_RULE = (
     "range(N_frames), min(num_samples, N_frames)); the population is its complete "
     "unfiltered test-window index."
 )
+VARIANT_ORDER = ("diffusion_only", "no_raft", "no_transformer", "full")
+ZOOM_RULE = (
+    "Centered square crop with side length max(16, floor(min(height, width) / 3)); "
+    "chosen geometrically and identically for every run, never by image quality."
+)
 
 
 def select_sample_indices(population_size: int, num_samples: int, seed: int) -> List[int]:
@@ -51,6 +56,30 @@ def select_sample_indices(population_size: int, num_samples: int, seed: int) -> 
         raise ValueError("num_samples must be positive.")
     count = min(num_samples, population_size)
     return sorted(random.Random(seed).sample(range(population_size), count))
+
+
+def load_or_create_shared_selection(
+    path: Path,
+    population_size: int,
+    num_samples: int,
+    seed: int,
+) -> Dict[str, Any]:
+    expected = {
+        "seed": seed,
+        "sample_indices": select_sample_indices(population_size, num_samples, seed),
+        "population_size": population_size,
+        "population": "complete unfiltered test-window index shared by all four runs",
+        "selection_rule": SELECTION_RULE,
+    }
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != expected:
+            raise RuntimeError(
+                f"Shared sample selection differs from the seeded rule: {path}"
+            )
+        return existing
+    write_json(path, expected)
+    return expected
 
 
 def load_eval_reports(paths: Iterable[Path]) -> List[Dict[str, Any]]:
@@ -110,6 +139,7 @@ def _save_figure(
     sidecar: Dict[str, Any],
 ) -> None:
     figure.savefig(path, dpi=180, bbox_inches="tight")
+    figure.savefig(path.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(figure)
     write_json(path.with_suffix(".sidecar.json"), sidecar)
 
@@ -246,6 +276,7 @@ def _predict_selected(
         seq_len=int(report.get("seq_len", 10)),
         crop_size=int(report.get("crop_size", 256)),
         train_mode=str(report.get("train_mode", "dehaze")),
+        model_variant=str(report.get("model_variant", "full")),
         mask_mode=str(report.get("mask_mode", "full")),
         mixed_precision=str(
             report.get("numerics", {}).get(
@@ -270,6 +301,7 @@ def _predict_selected(
         if key in report.get("numerics", {}):
             setattr(config, key, report["numerics"][key])
     config.enable_xformers_if_available = config.attention_backend == "xformers"
+    config.apply_model_variant()
     if dataset_root:
         config.override_dataset_root(dataset_root)
     else:
@@ -365,6 +397,7 @@ def generate_qualitative_figures(
     seed: int,
     sample_indices: List[int],
 ) -> List[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
     population_sizes = {int(report["N_frames"]) for report in reports}
     if len(population_sizes) != 1:
         raise ValueError(
@@ -374,7 +407,12 @@ def generate_qualitative_figures(
     variant_outputs = []
     checkpoints = []
     for index, report in enumerate(reports):
-        variant_checkpoint = checkpoint if index == 0 else Path(report.get("checkpoint_path", ""))
+        reported_checkpoint = report.get("checkpoint_path")
+        variant_checkpoint = (
+            Path(reported_checkpoint)
+            if reported_checkpoint
+            else checkpoint
+        )
         if not variant_checkpoint.is_dir():
             raise FileNotFoundError(
                 f"Checkpoint for variant {_variant(report, index)!r} does not exist: {variant_checkpoint}"
@@ -385,7 +423,10 @@ def generate_qualitative_figures(
         )
 
     sidecar = _sidecar_payload(reports, eval_paths, checkpoint, seed, sample_indices)
-    primary = variant_outputs[0]
+    full_index = next(
+        index for index, report in enumerate(reports) if _variant(report, index) == "full"
+    )
+    primary = variant_outputs[full_index]
     figure, axes = plt.subplots(len(sample_indices), 3, figsize=(12, 4 * len(sample_indices)), squeeze=False)
     for row, sample_index in enumerate(sample_indices):
         for column, key in enumerate(("hazy", "prediction", "target")):
@@ -421,7 +462,292 @@ def generate_qualitative_figures(
     figure.tight_layout()
     comparison_path = output_dir / "variant_qualitative_comparison.png"
     _save_figure(figure, comparison_path, sidecar)
-    return [qualitative_path, comparison_path]
+
+    errors = [
+        torch.abs(outputs[index]["prediction"] - outputs[index]["target"])
+        .mean(dim=1, keepdim=True)
+        for outputs in variant_outputs
+        for index in sample_indices
+    ]
+    error_max = max(float(error.max()) for error in errors)
+    figure, axes = plt.subplots(
+        len(sample_indices),
+        len(reports),
+        figsize=(3.3 * len(reports), 3.2 * len(sample_indices)),
+        squeeze=False,
+    )
+    image_handle = None
+    for row, sample_index in enumerate(sample_indices):
+        for column, outputs in enumerate(variant_outputs):
+            error = torch.abs(
+                outputs[sample_index]["prediction"] - outputs[sample_index]["target"]
+            ).mean(dim=1)[0].numpy()
+            image_handle = axes[row, column].imshow(
+                error,
+                cmap="magma",
+                vmin=0.0,
+                vmax=error_max,
+            )
+            axes[row, column].axis("off")
+            if row == 0:
+                axes[row, column].set_title(_variant(reports[column], column))
+    figure.colorbar(image_handle, ax=axes.ravel().tolist(), label="Mean absolute error")
+    error_path = output_dir / "shared_sample_error_maps.png"
+    error_sidecar = dict(sidecar)
+    error_sidecar["shared_color_scale"] = {"min": 0.0, "max": error_max}
+    _save_figure(figure, error_path, error_sidecar)
+
+    sample_image = _tensor_image(primary[sample_indices[0]]["target"])
+    height, width = sample_image.shape[:2]
+    side = max(16, min(height, width) // 3)
+    top = (height - side) // 2
+    left = (width - side) // 2
+    figure, axes = plt.subplots(
+        len(sample_indices),
+        columns,
+        figsize=(4 * columns, 4 * len(sample_indices)),
+        squeeze=False,
+    )
+    for row, sample_index in enumerate(sample_indices):
+        images = (
+            [variant_outputs[0][sample_index]["hazy"]]
+            + [outputs[sample_index]["prediction"] for outputs in variant_outputs]
+            + [variant_outputs[0][sample_index]["target"]]
+        )
+        for column, image in enumerate(images):
+            array = _tensor_image(image)
+            axes[row, column].imshow(
+                array[top : top + side, left : left + side],
+                interpolation="nearest",
+            )
+            axes[row, column].axis("off")
+            if row == 0:
+                axes[row, column].set_title(titles[column])
+    figure.tight_layout()
+    zoom_path = output_dir / "shared_sample_zoomed_crops.png"
+    zoom_sidecar = dict(sidecar)
+    zoom_sidecar["crop_rule"] = ZOOM_RULE
+    zoom_sidecar["crop_box_top_left_height_width"] = [top, left, side, side]
+    _save_figure(figure, zoom_path, zoom_sidecar)
+    return [qualitative_path, comparison_path, error_path, zoom_path]
+
+
+def _clip_index_ranges(report: Dict[str, Any]) -> Dict[str, List[int]]:
+    ranges = {}
+    offset = 0
+    for clip in report["per_clip"]:
+        count = int(clip["num_frames"])
+        ranges[str(clip["sequence_name"])] = list(range(offset, offset + count))
+        offset += count
+    if offset != int(report["N_frames"]):
+        raise RuntimeError("Per-clip frame counts do not match N_frames.")
+    return ranges
+
+
+def generate_failure_cases(
+    reports: List[Dict[str, Any]],
+    eval_paths: List[Path],
+    dataset_root: str,
+    output_dir: Path,
+    seed: int,
+    sample_indices: List[int],
+    count: int,
+) -> List[Path]:
+    full_index = next(
+        index for index, report in enumerate(reports) if _variant(report, index) == "full"
+    )
+    report = reports[full_index]
+    ranges = _clip_index_ranges(report)
+    ranked = sorted(
+        report["per_clip"],
+        key=lambda clip: (float(clip["psnr_mean"]), str(clip["sequence_name"])),
+    )[:count]
+    failure_indices = [ranges[str(clip["sequence_name"])][0] for clip in ranked]
+    checkpoint = Path(report["checkpoint_path"])
+    outputs = _predict_selected(
+        report,
+        checkpoint,
+        dataset_root,
+        failure_indices,
+        seed,
+    )
+    figure, axes = plt.subplots(len(failure_indices), 3, figsize=(11, 3.5 * len(failure_indices)), squeeze=False)
+    for row, (clip, index) in enumerate(zip(ranked, failure_indices)):
+        for column, key in enumerate(("hazy", "prediction", "target")):
+            axes[row, column].imshow(_tensor_image(outputs[index][key]))
+            axes[row, column].axis("off")
+            if row == 0:
+                axes[row, column].set_title(("Hazy", "Full model", "Ground truth")[column])
+        axes[row, 0].set_ylabel(str(clip["sequence_name"]))
+    figure.tight_layout()
+    path = output_dir / "failure_cases.png"
+    sidecar = _sidecar_payload(reports, eval_paths, checkpoint, seed, sample_indices)
+    sidecar.update(
+        {
+            "failure_selection_rule": (
+                "Lowest full-model per-clip PSNR from eval JSON, ties by sequence name; "
+                "display the first evaluable window of each selected clip."
+            ),
+            "failure_clip_names": [clip["sequence_name"] for clip in ranked],
+            "failure_sample_indices": failure_indices,
+        }
+    )
+    _save_figure(figure, path, sidecar)
+    return [path]
+
+
+def generate_temporal_visual(
+    reports: List[Dict[str, Any]],
+    eval_paths: List[Path],
+    dataset_root: str,
+    output_dir: Path,
+    seed: int,
+    sample_indices: List[int],
+) -> List[Path]:
+    by_variant = {
+        _variant(report, index): report
+        for index, report in enumerate(reports)
+    }
+    full = by_variant["full"]
+    baseline = by_variant["diffusion_only"]
+    ranges = _clip_index_ranges(full)
+    clip_name = sorted(ranges)[0]
+    indices = ranges[clip_name]
+    if len(indices) < 2:
+        raise RuntimeError(f"Temporal visual clip has fewer than two windows: {clip_name}")
+    visible = indices[: min(4, len(indices))]
+    full_outputs = _predict_selected(
+        full, Path(full["checkpoint_path"]), dataset_root, visible, seed
+    )
+    baseline_outputs = _predict_selected(
+        baseline, Path(baseline["checkpoint_path"]), dataset_root, visible, seed
+    )
+    full_clip = next(item for item in full["per_clip"] if item["sequence_name"] == clip_name)
+    baseline_clip = next(
+        item for item in baseline["per_clip"] if item["sequence_name"] == clip_name
+    )
+    figure = plt.figure(figsize=(4 * len(visible), 9))
+    grid = figure.add_gridspec(3, len(visible))
+    for column, index in enumerate(visible):
+        for row, (outputs, title) in enumerate(
+            ((full_outputs, "Full"), (baseline_outputs, "Diffusion only"))
+        ):
+            axis = figure.add_subplot(grid[row, column])
+            axis.imshow(_tensor_image(outputs[index]["prediction"]))
+            axis.axis("off")
+            axis.set_title(f"{title} t={column}")
+    axis = figure.add_subplot(grid[2, :])
+    axis.plot(
+        full_clip["temporal_consistency_l1_per_transition"],
+        marker="o",
+        label="Full",
+    )
+    axis.plot(
+        baseline_clip["temporal_consistency_l1_per_transition"],
+        marker="o",
+        label="Diffusion only",
+    )
+    axis.set_xlabel("Frame transition")
+    axis.set_ylabel("RAFT-warped temporal L1")
+    axis.grid(alpha=0.25)
+    axis.legend()
+    figure.tight_layout()
+    path = output_dir / "temporal_consistency_visual.png"
+    sidecar = _sidecar_payload(
+        reports, eval_paths, Path(full["checkpoint_path"]), seed, sample_indices
+    )
+    sidecar.update(
+        {
+            "clip_selection_rule": "Lexicographically first evaluated clip.",
+            "clip_name": clip_name,
+            "visible_sample_indices": visible,
+            "per_frame_error_source": "eval JSON per-clip transition arrays",
+        }
+    )
+    _save_figure(figure, path, sidecar)
+    return [path]
+
+
+def generate_training_curves(
+    reports: List[Dict[str, Any]],
+    eval_paths: List[Path],
+    metric_logs: List[Path],
+    output_dir: Path,
+    seed: int,
+    sample_indices: List[int],
+) -> List[Path]:
+    if len(metric_logs) != len(reports):
+        raise ValueError("Provide one --metric-log per eval JSON in matching variant order.")
+    figure, axes = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
+    for index, (report, path) in enumerate(zip(reports, metric_logs)):
+        if not path.is_file():
+            raise FileNotFoundError(f"Metric log does not exist: {path}")
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        steps = [row["step"] for row in rows if row.get("event") == "step"]
+        losses = [row["total_loss"] for row in rows if row.get("event") == "step"]
+        validation = [row for row in rows if row.get("event") == "validation"]
+        label = _variant(report, index)
+        axes[0].plot(steps, losses, label=label)
+        axes[1].plot(
+            [row["step"] for row in validation],
+            [row["val_psnr"] for row in validation],
+            marker="o",
+            label=f"{label} PSNR",
+        )
+    axes[0].set_ylabel("Total training loss")
+    axes[1].set_ylabel("Validation PSNR")
+    axes[1].set_xlabel("Optimizer step")
+    for axis in axes:
+        axis.grid(alpha=0.25)
+        axis.legend()
+    figure.tight_layout()
+    path = output_dir / "training_curves.png"
+    sidecar = _sidecar_payload(
+        reports, eval_paths, Path(reports[0]["checkpoint_path"]), seed, sample_indices
+    )
+    sidecar["metric_log_paths"] = [str(path.resolve()) for path in metric_logs]
+    _save_figure(figure, path, sidecar)
+    return [path]
+
+
+def generate_vae_ceiling_figure(
+    reports: List[Dict[str, Any]],
+    eval_paths: List[Path],
+    vae_path: Path,
+    output_dir: Path,
+    seed: int,
+    sample_indices: List[int],
+) -> List[Path]:
+    if not vae_path.is_file():
+        raise FileNotFoundError(f"VAE ceiling JSON does not exist: {vae_path}")
+    vae = json.loads(vae_path.read_text(encoding="utf-8"))
+    full = next(
+        report
+        for index, report in enumerate(reports)
+        if _variant(report, index) == "full"
+    )
+    metrics = ("psnr", "ssim", "lpips")
+    achieved = [_metric(full, metric) for metric in metrics]
+    ceilings = [vae["aggregate"][metric]["mean"] for metric in metrics]
+    figure, axes = plt.subplots(1, 3, figsize=(10, 3.6))
+    for axis, metric, value, ceiling in zip(axes, metrics, achieved, ceilings):
+        axis.bar(["Full model"], [value], color="tab:blue")
+        axis.axhline(ceiling, color="black", linestyle="--", label="VAE ceiling")
+        axis.set_title(metric.upper())
+        axis.legend(fontsize=8)
+        axis.grid(axis="y", alpha=0.25)
+    figure.tight_layout()
+    path = output_dir / "vae_ceiling_reference.png"
+    sidecar = _sidecar_payload(
+        reports, eval_paths, Path(full["checkpoint_path"]), seed, sample_indices
+    )
+    sidecar["vae_ceiling_json"] = str(vae_path.resolve())
+    _save_figure(figure, path, sidecar)
+    return [path]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -432,6 +758,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num-samples", type=int, default=4)
+    parser.add_argument("--shared-samples-json", type=Path, default=None)
+    parser.add_argument("--metric-log", type=Path, nargs="+", default=[])
+    parser.add_argument("--vae-ceiling-json", type=Path, default=None)
+    parser.add_argument("--num-failure-clips", type=int, default=3)
+    parser.add_argument("--force", action="store_true")
     parser.add_argument(
         "--metrics-only",
         action="store_true",
@@ -441,20 +772,81 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> List[Path]:
+    existing_checklist = args.output_dir / "figure_checklist.json"
+    existing_selection = (
+        args.shared_samples_json
+        or args.output_dir / "shared_sample_selection.json"
+    )
+    if existing_checklist.is_file() and existing_selection.is_file() and not args.force:
+        checklist = json.loads(existing_checklist.read_text(encoding="utf-8"))
+        if checklist.get("status") == "PASS":
+            existing = sorted(
+                path
+                for path in args.output_dir.iterdir()
+                if path.is_file()
+                and (
+                    path.suffix in {".png", ".pdf"}
+                    or path.name.endswith(".sidecar.json")
+                    or path.name
+                    in {
+                        "reference_weights.json",
+                        "figure_checklist.json",
+                        existing_selection.name,
+                    }
+                )
+            )
+            print(f"SKIP: complete paper figure set already exists in {args.output_dir}")
+            print(existing_checklist.read_text(encoding="utf-8"))
+            return existing
     reports = load_eval_reports(args.eval_json)
+    metric_logs_by_variant = (
+        {
+            _variant(report, index): path
+            for index, (report, path) in enumerate(zip(reports, args.metric_log))
+        }
+        if len(args.metric_log) == len(reports)
+        else {}
+    )
+    paired = sorted(
+        zip(reports, args.eval_json),
+        key=lambda item: (
+            VARIANT_ORDER.index(str(item[0].get("variant")))
+            if str(item[0].get("variant")) in VARIANT_ORDER
+            else len(VARIANT_ORDER)
+        ),
+    )
+    reports = [item[0] for item in paired]
+    args.eval_json = [item[1] for item in paired]
+    if metric_logs_by_variant:
+        args.metric_log = [
+            metric_logs_by_variant[_variant(report, index)]
+            for index, report in enumerate(reports)
+        ]
+    if not args.metrics_only:
+        variants = [_variant(report, index) for index, report in enumerate(reports)]
+        if variants != list(VARIANT_ORDER):
+            raise ValueError(
+                f"Final paper figures require variants {VARIANT_ORDER}, got {variants}"
+            )
     seed = int(reports[0].get("seed", 1234) if args.seed is None else args.seed)
-    sample_indices = select_sample_indices(int(reports[0]["N_frames"]), args.num_samples, seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    selection = {
-        "seed": seed,
-        "sample_indices": sample_indices,
-        "population": "complete unfiltered test-window index of the primary eval JSON",
-        "selection_rule": SELECTION_RULE,
-    }
-    write_json(args.output_dir / "sample_selection.json", selection)
+    population_sizes = {int(report["N_frames"]) for report in reports}
+    if len(population_sizes) != 1:
+        raise ValueError("All runs must expose the same full-test sample population.")
+    selection_path = (
+        args.shared_samples_json
+        or args.output_dir / "shared_sample_selection.json"
+    )
+    selection = load_or_create_shared_selection(
+        selection_path,
+        population_sizes.pop(),
+        args.num_samples,
+        seed,
+    )
+    sample_indices = selection["sample_indices"]
 
     progress = ProgressReporter(
-        2 if args.metrics_only else 3,
+        2 if args.metrics_only else 7,
         "Paper figure generation",
         leave=True,
     )
@@ -491,11 +883,93 @@ def run(args: argparse.Namespace) -> List[Path]:
             )
         )
         progress.update(1)
+        generated.extend(
+            generate_failure_cases(
+                reports,
+                args.eval_json,
+                args.dataset_root,
+                args.output_dir,
+                seed,
+                sample_indices,
+                args.num_failure_clips,
+            )
+        )
+        progress.update(1)
+        generated.extend(
+            generate_temporal_visual(
+                reports,
+                args.eval_json,
+                args.dataset_root,
+                args.output_dir,
+                seed,
+                sample_indices,
+            )
+        )
+        progress.update(1)
+        generated.extend(
+            generate_training_curves(
+                reports,
+                args.eval_json,
+                args.metric_log,
+                args.output_dir,
+                seed,
+                sample_indices,
+            )
+        )
+        progress.update(1)
+        if args.vae_ceiling_json is None:
+            raise ValueError("--vae-ceiling-json is required for final paper figures.")
+        generated.extend(
+            generate_vae_ceiling_figure(
+                reports,
+                args.eval_json,
+                args.vae_ceiling_json,
+                args.output_dir,
+                seed,
+                sample_indices,
+            )
+        )
+        progress.update(1)
     progress.close()
+    figure_paths = [path for path in generated if path.suffix == ".png"]
+    checklist = {}
+    for path in figure_paths:
+        required = [
+            path,
+            path.with_suffix(".pdf"),
+            path.with_suffix(".sidecar.json"),
+        ]
+        checklist[path.stem] = all(item.is_file() and item.stat().st_size > 0 for item in required)
+    required_names = {
+        "variant_metrics",
+        "qualitative_grid",
+        "variant_qualitative_comparison",
+        "shared_sample_error_maps",
+        "shared_sample_zoomed_crops",
+        "temporal_consistency_visual",
+        "reference_weights",
+        "failure_cases",
+        "training_curves",
+        "vae_ceiling_reference",
+    }
+    missing = sorted(name for name in required_names if not checklist.get(name))
+    checklist_path = args.output_dir / "figure_checklist.json"
+    write_json(
+        checklist_path,
+        {
+            "status": "PASS" if not missing else "FAIL",
+            "figures": checklist,
+            "missing": missing,
+            "shared_sample_selection_json": str(selection_path.resolve()),
+        },
+    )
+    if missing:
+        raise RuntimeError(f"Final paper figure checklist failed: {missing}")
     print(json.dumps(selection, indent=2))
+    print(json.dumps({"figure_checklist": checklist, "status": "PASS"}, indent=2))
     for path in generated:
         progress.write(f"Wrote {path}")
-    return generated
+    return [selection_path, *generated, checklist_path]
 
 
 def main() -> None:

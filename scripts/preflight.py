@@ -30,6 +30,7 @@ from src.provenance import (
     find_numerics_mismatches,
     find_seed_mismatches,
     loss_weights,
+    model_variant_settings,
     peak_gpu_memory_bytes,
     runtime_environment,
     trainable_parameter_counts,
@@ -144,7 +145,13 @@ def _prepare_timing_runtime(config: TRDNConfig, train_loader: DataLoader, checkp
         conditioning_adapter,
     )
     counts = trainable_parameter_counts(modules, optimizer)
-    if temporal_transformer is not None:
+    if temporal_memory is None:
+        diffusion["unet"], optimizer, train_loader = accelerator.prepare(
+            diffusion["unet"],
+            optimizer,
+            train_loader,
+        )
+    elif temporal_transformer is not None:
         (
             diffusion["unet"],
             temporal_memory,
@@ -283,12 +290,25 @@ def _time_training_steps(
 
 
 def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
+    aliases = [
+        name
+        for enabled, name in (
+            (getattr(args, "no_raft", False), "no_raft"),
+            (getattr(args, "no_transformer", False), "no_transformer"),
+            (getattr(args, "diffusion_only", False), "diffusion_only"),
+        )
+        if enabled
+    ]
+    if len(aliases) > 1:
+        raise ValueError("Choose only one model ablation shortcut.")
+    model_variant = aliases[0] if aliases else args.model_variant
     config = TRDNConfig(
         project_root=args.project_root,
         max_train_steps=args.max_train_steps,
         num_epochs=args.num_epochs,
         resume_from_checkpoint=args.resume_from_checkpoint,
         train_mode=args.train_mode,
+        model_variant=model_variant,
         mask_mode=args.mask_mode,
         seed=args.seed,
         seq_len=args.seq_len,
@@ -318,6 +338,7 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         apply_numerics_preset(config, args.preset)
     if args.dataset_root:
         config.override_dataset_root(args.dataset_root)
+    config.apply_model_variant()
     print(f"Resolved preflight seed: {config.seed}")
     seed_mismatches = find_seed_mismatches(Path(config.paths()["logs"]), config)
     if seed_mismatches:
@@ -504,8 +525,13 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         }
 
     weights = loss_weights(config)
+    active_names = set(model_variant_settings(config)["active_loss_terms"])
     active_losses = {
-        name: {"weight": weight, "status": "ACTIVE" if weight != 0.0 else "INACTIVE"}
+        name: {
+            "weight": weight,
+            "status": "ACTIVE" if name in active_names and weight != 0.0 else "INACTIVE",
+            "computed": name in active_names,
+        }
         for name, weight in weights.items()
     }
     environment = runtime_environment(config.mixed_precision)
@@ -516,7 +542,11 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
 
     report = {
         "status": "PASS",
-        "resolved_modes": {"train_mode": config.train_mode, "mask_mode": resolved_mask},
+        "resolved_modes": {
+            "train_mode": config.train_mode,
+            "mask_mode": resolved_mask,
+            "model_variant": config.model_variant,
+        },
         "config": config.to_dict(),
         "dataset_sizes": sizes,
         "dataset_layouts": dataset_layouts,
@@ -552,6 +582,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-from-checkpoint", default="")
     parser.add_argument("--allow-resume", action="store_true")
     parser.add_argument("--train-mode", default="dehaze", choices=["dehaze", "reconstruct_synthetic"])
+    parser.add_argument(
+        "--model-variant",
+        choices=["full", "no_raft", "no_transformer", "diffusion_only"],
+        default="full",
+    )
+    parser.add_argument("--no-raft", action="store_true")
+    parser.add_argument("--no-transformer", action="store_true")
+    parser.add_argument("--diffusion-only", action="store_true")
     parser.add_argument("--mask-mode", default="auto")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--seq-len", type=int, default=10)

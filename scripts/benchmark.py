@@ -7,8 +7,10 @@ independently constructed runtime using the baseline plus the named overrides.
 import argparse
 import gc
 import json
+import shutil
 import statistics
 import sys
+import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -94,6 +96,7 @@ def _measure_variant(
     warmup_steps: int,
     timed_steps: int,
     baseline_signature: Dict[str, float] | None,
+    measure_checkpoint_size: bool = False,
 ) -> Dict[str, Any]:
     set_seed(config.seed)
     torch.cuda.empty_cache()
@@ -180,6 +183,16 @@ def _measure_variant(
     median_gpu = statistics.median(gpu_durations)
     median_data_wait = statistics.median(data_wait_durations)
     peak_bytes = int(torch.cuda.max_memory_allocated())
+    measured_checkpoint_bytes = None
+    if measure_checkpoint_size:
+        checkpoint_dir = Path(tempfile.mkdtemp(prefix="trdn-benchmark-checkpoint-"))
+        try:
+            accelerator.save_state(str(checkpoint_dir))
+            measured_checkpoint_bytes = sum(
+                path.stat().st_size for path in checkpoint_dir.rglob("*") if path.is_file()
+            )
+        finally:
+            shutil.rmtree(checkpoint_dir)
     result = {
         "name": name,
         "category": category,
@@ -197,6 +210,7 @@ def _measure_variant(
         },
         "warmup_steps": warmup_steps,
         "timed_steps": timed_steps,
+        "train_batches_per_epoch": len(loader),
         "warmup_seconds": warmup_seconds,
         "median_seconds_per_step": median_step,
         "median_gpu_seconds_per_step": median_gpu,
@@ -209,6 +223,7 @@ def _measure_variant(
         "raft_seconds_total": raft_seconds,
         "raft_fraction_of_gpu_step": raft_seconds / max(sum(gpu_durations), 1e-12),
         "optimizer_steps_skipped": overflow_skips,
+        "measured_checkpoint_bytes": measured_checkpoint_bytes,
         "loss_signature": signature,
         "numerics_changed": _numerics_changed(baseline_signature, signature),
     }
@@ -288,6 +303,58 @@ def _print_table(rows: list[Dict[str, Any]]) -> None:
         print(" ".join(str(value).ljust(width) for value, (_title, width) in zip(values, columns)))
 
 
+def _recommended_preset(rows: list[Dict[str, Any]]) -> Dict[str, Any]:
+    measured = [row for row in rows if row["status"] == "measured"]
+    baseline = next(row for row in measured if row["name"] == "baseline")
+
+    def fastest(*categories: str) -> Dict[str, Any]:
+        candidates = [
+            row
+            for row in measured
+            if row["name"] == "baseline" or row["category"] in categories
+        ]
+        return max(candidates, key=lambda row: row["samples_per_second"])
+
+    combined = fastest("batch_checkpointing_combined", "batch_size", "gradient_checkpointing")
+    precision = fastest("precision")
+    tf32 = fastest("tf32")
+    cudnn = fastest("cudnn_benchmark")
+    attention = fastest("attention_backend")
+    compiled = fastest("torch_compile")
+    channels_last = fastest("channels_last")
+    preset = {
+        "preset_name": "a40_locked",
+        "precision": precision["overrides"]["mixed_precision"],
+        "allow_tf32": tf32["overrides"]["allow_tf32"],
+        "cudnn_benchmark": cudnn["overrides"]["cudnn_benchmark"],
+        "attention_backend": attention["overrides"]["attention_backend"],
+        "batch_size": combined["overrides"]["batch_size"],
+        "gradient_checkpointing": combined["overrides"]["gradient_checkpointing"],
+        "torch_compile": compiled["overrides"]["torch_compile"],
+        "channels_last": channels_last["overrides"]["channels_last"],
+    }
+    sources = {
+        "precision": precision["name"],
+        "allow_tf32": tf32["name"],
+        "cudnn_benchmark": cudnn["name"],
+        "attention_backend": attention["name"],
+        "batch_size": combined["name"],
+        "gradient_checkpointing": combined["name"],
+        "torch_compile": compiled["name"],
+        "channels_last": channels_last["name"],
+    }
+    return {
+        "values": preset,
+        "source_rows": sources,
+        "selection_rule": (
+            "For each one-variable category, select the measured row with the highest "
+            "samples/sec against baseline. Batch size and gradient checkpointing use "
+            "the fastest measured combined row."
+        ),
+        "baseline_row": baseline["name"],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", default="/workspace/datasets/REVIDE")
@@ -304,6 +371,8 @@ def main() -> None:
     )
     parser.add_argument("--num-workers", type=int, nargs="+", default=[0, 2, 4, 8])
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--planned-epochs", type=int, default=30)
+    parser.add_argument("--planned-runs", type=int, default=4)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -344,6 +413,7 @@ def main() -> None:
                 args.warmup_steps,
                 args.timed_steps,
                 baseline_signature,
+                measure_checkpoint_size=name == "baseline",
             )
             if name == "baseline":
                 baseline_signature = row["loss_signature"]
@@ -381,12 +451,42 @@ def main() -> None:
         if row["category"] == "batch_checkpointing_combined" and row["status"] == "measured"
     ]
     best_combined = max(combined, key=lambda row: row["samples_per_second"]) if combined else None
+    recommendation = _recommended_preset(rows)
+    baseline_row = next(row for row in rows if row["name"] == "baseline")
+    projection_row_name = recommendation["source_rows"]["batch_size"]
+    projection_row = next(row for row in rows if row["name"] == projection_row_name)
+    train_batches = int(projection_row["train_batches_per_epoch"])
+    projected_steps_per_run = train_batches * args.planned_epochs
+    checkpoint_bytes = int(baseline_row["measured_checkpoint_bytes"])
     report = {
         "device": torch.cuda.get_device_name(0),
         "torch_version": torch.__version__,
         "baseline": baseline.__dict__,
         "rows": rows,
         "best_batch_checkpointing_combination": best_combined,
+        "recommended_preset": recommendation,
+        "projections": {
+            "basis": (
+                "Measured full-model sec/step from the recommended batch/checkpointing "
+                "row and measured temporary checkpoint bytes. Four-run time assumes "
+                "each variant takes the same time; variants are not measured separately."
+            ),
+            "timing_source_row": projection_row_name,
+            "planned_epochs": args.planned_epochs,
+            "planned_runs": args.planned_runs,
+            "train_batches_per_epoch": train_batches,
+            "steps_per_run": projected_steps_per_run,
+            "seconds_per_run": (
+                projected_steps_per_run * projection_row["median_seconds_per_step"]
+            ),
+            "seconds_all_runs": (
+                projected_steps_per_run
+                * projection_row["median_seconds_per_step"]
+                * args.planned_runs
+            ),
+            "measured_checkpoint_bytes": checkpoint_bytes,
+            "checkpoint_bytes_all_runs": checkpoint_bytes * args.planned_runs,
+        },
     }
     write_json(args.output, report)
     _print_table(rows)

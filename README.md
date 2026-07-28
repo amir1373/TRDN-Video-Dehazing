@@ -8,7 +8,11 @@ TRDN reconstructs a clean current frame from a hazy 10-frame sequence:
 [frame(t-9), ..., frame(t-1), frame(t)] -> clean frame(t)
 ```
 
-The primary workflow is a VS Code notebook connected to a Google Colab GPU runtime. The reusable implementation lives in `src/`, and the notebook is kept in `notebooks/TRDN_REVIDE_Colab.ipynb`.
+The paid-run workflow is `notebooks/TRDN_REVIDE_RunPod.ipynb`. It is an
+ordered A-Q driver for environment checks, dataset validation, the VAE ceiling,
+preflight, measured A40 benchmarking, numerics locking, four detached training
+runs, evaluation, final figures, tables, and the download bundle. The older
+Colab notebook remains available for development.
 
 ## Notebook / Repository Synchronization
 
@@ -25,6 +29,25 @@ The notebook is the execution interface, not a second implementation. All major 
 - notebook execution helpers: `src/notebook_utils.py`
 
 Future code changes should be made in `src/` first. The notebook should remain limited to setup, configuration, visualization, debugging, and launch cells.
+
+## RunPod Paid Run
+
+Edit only cell A in `notebooks/TRDN_REVIDE_RunPod.ipynb`, then execute in
+order. Stop at cell G to review measured cost and benchmark results. Cell H
+requires the explicit `LOCK_A40` confirmation before it writes a runnable
+`configs/a40.yaml`.
+
+The four training cells launch detached jobs through
+`scripts/runpod_workflow.py` and `scripts/runpod_jobs.py`. Their logs and job
+state live under each run directory, so cell J can be interrupted and rerun
+without affecting training. The variants are independently trained `full`,
+`no_raft`, `no_transformer`, and `diffusion_only`; the last constructs only
+the diffusion U-Net and uses diffusion, L1, and LPIPS losses.
+
+Cell O writes one shared seeded sample-selection JSON before generating any
+qualitative output. Every paper figure has PNG, PDF, and provenance sidecar
+outputs. Cell Q refuses an incomplete artifact set and creates the archive
+that should be downloaded before ending the pod.
 
 ## Research Motivation
 

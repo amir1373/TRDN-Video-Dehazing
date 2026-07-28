@@ -40,3 +40,47 @@ def test_runpod_notebook_is_a_stateless_script_driver():
         for script in required_scripts
     ]
     assert positions == sorted(positions)
+
+
+def test_runpod_notebook_has_ordered_detached_workflow():
+    notebook_path = (
+        Path(__file__).parents[1] / "notebooks" / "TRDN_REVIDE_RunPod.ipynb"
+    )
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    cells = notebook["cells"]
+    code_cells = [cell for cell in cells if cell["cell_type"] == "code"]
+    combined = "\n".join("".join(cell["source"]) for cell in cells)
+
+    assert all(cell.get("outputs", []) == [] for cell in code_cells)
+    assert all(cell.get("execution_count") is None for cell in code_cells)
+    assert all(
+        index > 0 and cells[index - 1]["cell_type"] == "markdown"
+        for index, cell in enumerate(cells)
+        if cell["cell_type"] == "code"
+    )
+    for index, cell in enumerate(cells):
+        if cell["cell_type"] == "code":
+            compile(
+                "".join(cell["source"]),
+                f"{notebook_path.name}:cell-{index}",
+                "exec",
+            )
+
+    headings = [
+        "".join(cell["source"]).splitlines()[0]
+        for cell in cells
+        if cell["cell_type"] == "markdown"
+    ]
+    assert [heading.split(".", 1)[0] for heading in headings] == [
+        f"# {letter}" for letter in "ABCDEFGHIJKLMNOPQ"
+    ]
+    assert "/workspace" in "".join(cells[1]["source"])
+    assert "/workspace" not in "\n".join(
+        "".join(cell["source"]) for cell in cells[2:]
+    )
+    assert "launch-training" in combined
+    assert "--resume-if-interrupted" in combined
+    assert '"list"' in combined and '"monitor"' in combined and '"stop"' in combined
+    assert "shared_sample_selection.json" in combined
+    assert "make_paper_figures.py" in combined
+    assert "bundle" in combined

@@ -172,6 +172,7 @@ def build_test_dataset(config: TRDNConfig, args: argparse.Namespace) -> REVIDESe
         train_mode=args.train_mode,
         mask_mode=args.mask_mode,
         include_prev_frame=False,
+        include_reference_frames=config.model_variant != "diffusion_only",
     )
 
 
@@ -214,7 +215,9 @@ def evaluate(
         config,
         args.checkpoint,
         device,
-        diffusion_only=bool(args.diffusion_only),
+        diffusion_only=bool(
+            args.diffusion_only or config.model_variant == "diffusion_only"
+        ),
         use_ema=bool(getattr(args, "use_ema", False)),
     )
     loss_bundle = LossBundle(device)
@@ -278,7 +281,7 @@ def evaluate(
                 }
                 sample_ids = [f"{clip_name}:{frame_position}"]
 
-                if args.diffusion_only:
+                if args.diffusion_only or config.model_variant == "diffusion_only":
                     output = infer_diffusion_only_batch(
                         batch["mask"],
                         batch["corrupted_frame"],
@@ -353,6 +356,8 @@ def evaluate(
             "lpips_mean": float(np.mean(clip_lpips)),
             "temporal_consistency_l1_mean": float(np.mean(clip_temporal_error)) if clip_temporal_error else None,
             "temporal_consistency_coverage_mean": float(np.mean(clip_temporal_coverage)) if clip_temporal_coverage else None,
+            "temporal_consistency_l1_per_transition": clip_temporal_error,
+            "temporal_consistency_coverage_per_transition": clip_temporal_coverage,
         }
         per_clip_results.append(clip_result)
         all_psnr.extend(clip_psnr)
@@ -417,13 +422,18 @@ def evaluate(
     return {
         "schema_version": 2,
         "variant": getattr(args, "variant", "") or (
-            "diffusion_only" if args.diffusion_only else f"trdn_t{config.seq_len}"
+            config.model_variant
+            if config.model_variant != "full"
+            else f"trdn_t{config.seq_len}"
         ),
         "checkpoint_path": args.checkpoint,
         "checkpoint_git_sha": checkpoint_metadata.get("git_commit_sha", "unknown"),
         "train_mode": dataset.train_mode,
         "mask_mode": dataset._resolve_mask_mode(),
-        "diffusion_only_baseline": args.diffusion_only,
+        "diffusion_only_baseline": (
+            args.diffusion_only or config.model_variant == "diffusion_only"
+        ),
+        "model_variant": config.model_variant,
         "temporal_metric": {
             "name": "raft_flow_warped_prediction_l1",
             "metric_raft_is_independent_of_model": True,
@@ -507,6 +517,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--seq-len", type=int, default=10)
     parser.add_argument("--train-mode", default="dehaze", choices=["dehaze", "reconstruct_synthetic"])
+    parser.add_argument(
+        "--model-variant",
+        choices=["full", "no_raft", "no_transformer", "diffusion_only"],
+        default=None,
+    )
     parser.add_argument("--mask-mode", default="auto")
     parser.add_argument("--allow-mode-mismatch", action="store_true")
     parser.add_argument("--variant", default="", help="Stable label used by figures and tables.")
@@ -547,6 +562,14 @@ def main() -> None:
     except FileNotFoundError:
         saved_metadata = {}
     saved_quality = saved_metadata.get("quality_settings", {})
+    saved_variant = saved_metadata.get("model_variant", {})
+    if isinstance(saved_variant, dict):
+        saved_variant = saved_variant.get("name")
+    model_variant = (
+        args.model_variant
+        or saved_variant
+        or ("diffusion_only" if args.diffusion_only else "full")
+    )
     guidance_scale = float(
         args.guidance_scale
         if args.guidance_scale is not None
@@ -567,6 +590,7 @@ def main() -> None:
         allow_mode_mismatch=args.allow_mode_mismatch,
         seq_len=args.seq_len,
         train_mode=args.train_mode,
+        model_variant=model_variant,
         mask_mode=args.mask_mode,
         guidance_scale=guidance_scale,
         text_prompt=text_prompt,
@@ -574,6 +598,7 @@ def main() -> None:
     )
     if args.preset:
         apply_numerics_preset(config, args.preset)
+    config.apply_model_variant()
     if args.dataset_root:
         config.override_dataset_root(args.dataset_root)
 

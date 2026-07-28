@@ -21,6 +21,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-mode-mismatch", action="store_true")
     parser.add_argument("--allow-output-collision", action="store_true")
     parser.add_argument("--train-mode", default="dehaze", choices=["dehaze", "reconstruct_synthetic"])
+    parser.add_argument(
+        "--model-variant",
+        choices=["full", "no_raft", "no_transformer", "diffusion_only"],
+        default="full",
+    )
+    parser.add_argument("--no-raft", action="store_true")
+    parser.add_argument("--no-transformer", action="store_true")
+    parser.add_argument("--diffusion-only", action="store_true")
     parser.add_argument("--mask-mode", default="auto")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--seq-len", type=int, default=10)
@@ -60,7 +68,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    aliases = [
+        name
+        for enabled, name in (
+            (args.no_raft, "no_raft"),
+            (args.no_transformer, "no_transformer"),
+            (args.diffusion_only, "diffusion_only"),
+        )
+        if enabled
+    ]
+    if len(aliases) > 1:
+        parser.error("choose only one of --no-raft, --no-transformer, --diffusion-only")
+    if aliases and args.model_variant != "full":
+        parser.error("do not combine --model-variant with an ablation shortcut")
+    model_variant = aliases[0] if aliases else args.model_variant
 
     config = TRDNConfig(
         project_root=args.project_root,
@@ -70,6 +93,7 @@ def main():
         allow_mode_mismatch=args.allow_mode_mismatch,
         allow_output_collision=args.allow_output_collision,
         train_mode=args.train_mode,
+        model_variant=model_variant,
         mask_mode=args.mask_mode,
         seed=args.seed,
         seq_len=args.seq_len,
