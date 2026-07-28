@@ -1,5 +1,7 @@
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
+import pytest
 
 from src.losses import LossBundle, weighted_total_loss
 from src.warp import warp_with_flow
@@ -12,6 +14,33 @@ class _Config:
     w_temporal = 0.05
     w_flow = 0.05
     w_reference = 0.0
+
+
+class _DifferenceLPIPS(nn.Module):
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return torch.abs(pred - target).mean(dim=(1, 2, 3), keepdim=True)
+
+
+class _ZeroLPIPS(nn.Module):
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return pred.new_zeros((pred.shape[0], 1, 1, 1))
+
+
+def test_lpips_startup_probe_is_nonzero_for_different_tensors():
+    bundle = LossBundle.__new__(LossBundle)
+    nn.Module.__init__(bundle)
+    bundle.lpips_model = _DifferenceLPIPS()
+
+    assert bundle._assert_lpips_nonzero("cpu") > 0.0
+
+
+def test_lpips_startup_probe_rejects_silent_zero():
+    bundle = LossBundle.__new__(LossBundle)
+    nn.Module.__init__(bundle)
+    bundle.lpips_model = _ZeroLPIPS()
+
+    with pytest.raises(RuntimeError, match="returned zero"):
+        bundle._assert_lpips_nonzero("cpu")
 
 
 def test_legacy_temporal_consistency_loss_matches_old_formula():

@@ -55,7 +55,16 @@ def main():
                 diffusion["unet"], temporal_memory, reference_selector, conditioning_adapter, optimizer
             )
         accelerator.load_state(args.checkpoint)
-    raft_model = load_raft(device, config.freeze_raft) if config.use_raft_alignment and torch.cuda.is_available() else None
+    raft_model = (
+        load_raft(
+            device,
+            config.freeze_raft,
+            config.validate_raft_flow,
+            config.raft_max_flow_factor,
+        )
+        if config.use_raft_alignment and torch.cuda.is_available()
+        else None
+    )
     dataset = REVIDESequenceDataset(
         config.root_for_split(config.val_split),
         split=config.val_split,

@@ -10,13 +10,20 @@ from .warp import warp_with_flow
 from .assertions import assert_flow, assert_frames, assert_image, assert_warped_references
 
 
-def load_raft(device: str = "cuda", freeze: bool = True) -> nn.Module:
+def load_raft(
+    device: str = "cuda",
+    freeze: bool = True,
+    validate_flow: bool = True,
+    max_flow_factor: float = 2.0,
+) -> nn.Module:
     from torchvision.models.optical_flow import Raft_Large_Weights, raft_large
 
     model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=True).to(device).eval()
     if freeze:
         for param in model.parameters():
             param.requires_grad_(False)
+    model._trdn_validate_flow = validate_flow
+    model._trdn_max_flow_factor = max_flow_factor
     return model
 
 
@@ -39,7 +46,34 @@ def compute_raft_flow(raft_model: nn.Module, source: torch.Tensor, target: torch
     flow = raft_model(_raft_preprocess(source_in), _raft_preprocess(target_in), num_flow_updates=iters)[-1]
     flow = flow[..., :height, :width]
     assert_flow(flow, name="raft_flow")
+    if getattr(raft_model, "_trdn_validate_flow", True):
+        assert_raft_flow_sane(
+            flow,
+            height,
+            width,
+            max_flow_factor=float(getattr(raft_model, "_trdn_max_flow_factor", 2.0)),
+        )
     return flow
+
+
+def assert_raft_flow_sane(
+    flow: torch.Tensor,
+    height: int,
+    width: int,
+    max_flow_factor: float = 2.0,
+) -> None:
+    if not torch.isfinite(flow).all():
+        raise FloatingPointError("RAFT produced NaN or Inf flow values.")
+    if max_flow_factor <= 0:
+        raise ValueError(f"max_flow_factor must be positive, got {max_flow_factor}")
+    maximum_allowed = max(height, width) * max_flow_factor
+    maximum_observed = torch.linalg.vector_norm(flow.float(), dim=1).amax()
+    if maximum_observed > maximum_allowed:
+        raise FloatingPointError(
+            "RAFT flow magnitude is implausible for the frame size: "
+            f"max={float(maximum_observed):.3f}, allowed={maximum_allowed:.3f} "
+            f"for {height}x{width} frames."
+        )
 
 
 @torch.no_grad()

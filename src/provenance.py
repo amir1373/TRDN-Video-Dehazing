@@ -20,6 +20,16 @@ LOSS_WEIGHT_FIELDS = (
     "w_flow",
     "w_reference",
 )
+NUMERICS_FIELDS = (
+    "mixed_precision",
+    "allow_tf32",
+    "cudnn_benchmark",
+    "attention_backend",
+    "batch_size",
+    "enable_unet_gradient_checkpointing",
+    "enable_torch_compile",
+    "channels_last",
+)
 
 
 def _run_git(*args: str) -> str:
@@ -50,6 +60,10 @@ def loss_weights(config: TRDNConfig) -> Dict[str, float]:
     return {name.removeprefix("w_"): float(getattr(config, name)) for name in LOSS_WEIGHT_FIELDS}
 
 
+def numerics_settings(config: TRDNConfig) -> Dict[str, Any]:
+    return {name: getattr(config, name) for name in NUMERICS_FIELDS}
+
+
 def checkpoint_metadata(
     config: TRDNConfig,
     step: int,
@@ -73,6 +87,7 @@ def checkpoint_metadata(
         "seq_len": int(config.seq_len),
         "crop_size": int(config.crop_size),
         "loss_weights": loss_weights(config),
+        "numerics": numerics_settings(config),
         "checkpoint_retention": {
             "keep_last_n_checkpoints": int(config.keep_last_n_checkpoints),
             "always_keep_best": bool(config.always_keep_best),
@@ -261,11 +276,41 @@ def create_run_manifest(
         "dataset_sizes": {name: dataset_size(dataset) for name, dataset in datasets.items()},
         "trainable_parameters": trainable_parameter_counts(modules, optimizer),
         "environment": runtime_environment(config.mixed_precision),
+        "numerics": numerics_settings(config),
         "metrics_log": str((path.parent / "metrics.jsonl").resolve()),
         "evaluations": [],
     }
     write_json(path, manifest)
     return manifest
+
+
+def find_numerics_mismatches(
+    logs_root: Path,
+    config: TRDNConfig,
+) -> list[Dict[str, Any]]:
+    current = numerics_settings(config)
+    mismatches = []
+    for manifest_path in sorted((logs_root / "runs").glob("*/run_manifest.json")):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        existing = manifest.get("numerics")
+        if not isinstance(existing, dict):
+            continue
+        differences = {
+            key: {"existing": existing.get(key), "current": value}
+            for key, value in current.items()
+            if existing.get(key) != value
+        }
+        if differences:
+            mismatches.append(
+                {
+                    "manifest_path": str(manifest_path.resolve()),
+                    "differences": differences,
+                }
+            )
+    return mismatches
 
 
 def update_manifest(path: Path, updates: Mapping[str, Any]) -> Dict[str, Any]:

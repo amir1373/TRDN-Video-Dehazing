@@ -242,8 +242,25 @@ def _predict_selected(
         crop_size=int(report.get("crop_size", 256)),
         train_mode=str(report.get("train_mode", "dehaze")),
         mask_mode=str(report.get("mask_mode", "full")),
-        mixed_precision="fp16" if torch.cuda.is_available() else "no",
+        mixed_precision=str(
+            report.get("numerics", {}).get(
+                "mixed_precision",
+                "fp16" if torch.cuda.is_available() else "no",
+            )
+        ),
     )
+    for key in (
+        "allow_tf32",
+        "cudnn_benchmark",
+        "attention_backend",
+        "batch_size",
+        "enable_unet_gradient_checkpointing",
+        "enable_torch_compile",
+        "channels_last",
+    ):
+        if key in report.get("numerics", {}):
+            setattr(config, key, report["numerics"][key])
+    config.enable_xformers_if_available = config.attention_backend == "xformers"
     if dataset_root:
         config.override_dataset_root(dataset_root)
     else:

@@ -1,4 +1,4 @@
-"""Real-data, real-weight safety and cost preflight for TRDN training."""
+"""Real-data runtime safety and cost preflight for TRDN training."""
 
 import argparse
 import json
@@ -20,9 +20,11 @@ from scripts.evaluate_full_test import evaluate
 from src.config import TRDNConfig
 from src.flow import load_raft
 from src.losses import LossBundle
+from src.presets import apply_numerics_preset
 from src.provenance import (
     dataset_size,
     effective_mask_mode,
+    find_numerics_mismatches,
     loss_weights,
     peak_gpu_memory_bytes,
     runtime_environment,
@@ -155,9 +157,15 @@ def _prepare_timing_runtime(config: TRDNConfig, train_loader: DataLoader, checkp
         )
     diffusion["vae"].to(accelerator.device)
     diffusion["text_encoder"].to(accelerator.device)
-    accelerator.load_state(checkpoint)
+    if checkpoint:
+        accelerator.load_state(checkpoint)
     raft_model = (
-        load_raft(str(accelerator.device), config.freeze_raft)
+        load_raft(
+            str(accelerator.device),
+            config.freeze_raft,
+            config.validate_raft_flow,
+            config.raft_max_flow_factor,
+        )
         if config.use_raft_alignment and torch.cuda.is_available()
         else None
     )
@@ -267,6 +275,8 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         keep_last_n_checkpoints=args.keep_last_n_checkpoints,
         num_inference_steps=args.num_steps,
     )
+    if args.preset:
+        apply_numerics_preset(config, args.preset)
     if args.dataset_root:
         config.override_dataset_root(args.dataset_root)
 
@@ -279,10 +289,17 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
             "resume_from_checkpoint must be empty for preflight unless --allow-resume is explicit."
         )
 
-    checkpoint = Path(args.checkpoint)
-    if not checkpoint.is_dir():
-        raise FileNotFoundError(f"Real checkpoint directory does not exist: {checkpoint}")
-    validate_checkpoint_modes(checkpoint, config, allow_mode_mismatch=False)
+    checkpoint = Path(args.checkpoint) if args.checkpoint else None
+    if checkpoint is not None:
+        if not checkpoint.is_dir():
+            raise FileNotFoundError(f"Real checkpoint directory does not exist: {checkpoint}")
+        validate_checkpoint_modes(checkpoint, config, allow_mode_mismatch=False)
+
+    numerics_mismatches = find_numerics_mismatches(Path(config.paths()["logs"]), config)
+    if numerics_mismatches:
+        _banner("NUMERICS WARNING")
+        print(json.dumps(numerics_mismatches, indent=2, sort_keys=True))
+        print("Ablation results are not comparable until these settings match.")
 
     train_dataset, val_dataset = make_datasets(config)
     test_dataset = make_test_dataset_for_manifest(config)
@@ -327,7 +344,11 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     )
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
-    timing_runtime = _prepare_timing_runtime(config, train_loader, str(checkpoint))
+    timing_runtime = _prepare_timing_runtime(
+        config,
+        train_loader,
+        str(checkpoint) if checkpoint is not None else "",
+    )
     timing = _time_training_steps(
         timing_runtime,
         config,
@@ -348,42 +369,67 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         timing["temporal_disabled_seconds_per_step_median"] * total_steps / 3600.0
     )
 
-    checkpoint_bytes = _checkpoint_size_bytes(checkpoint)
+    checkpoint_bytes = _checkpoint_size_bytes(checkpoint) if checkpoint is not None else None
     periodic_saves = total_steps // max(config.checkpoint_every, 1)
     retained_step_checkpoints = min(periodic_saves, config.keep_last_n_checkpoints)
     retained_named_checkpoints = 3  # last, best_psnr, best_ssim; best_* are never pruned
     retained_count_upper_bound = retained_step_checkpoints + retained_named_checkpoints
-    storage_bytes = checkpoint_bytes * retained_count_upper_bound
+    storage_bytes = (
+        checkpoint_bytes * retained_count_upper_bound
+        if checkpoint_bytes is not None
+        else None
+    )
     storage = {
-        "measured_checkpoint_path": str(checkpoint.resolve()),
+        "measured_checkpoint_path": str(checkpoint.resolve()) if checkpoint is not None else None,
         "measured_checkpoint_bytes": checkpoint_bytes,
         "retained_checkpoint_count_upper_bound": retained_count_upper_bound,
         "estimated_retained_storage_bytes": storage_bytes,
-        "estimated_retained_storage_gb": storage_bytes / 1_000_000_000.0,
-        "warning_over_100_gb": storage_bytes > 100_000_000_000,
+        "estimated_retained_storage_gb": (
+            storage_bytes / 1_000_000_000.0 if storage_bytes is not None else None
+        ),
+        "warning_over_100_gb": (
+            storage_bytes > 100_000_000_000 if storage_bytes is not None else False
+        ),
+        "status": "measured" if checkpoint is not None else "unavailable_before_first_checkpoint",
     }
 
-    eval_args = argparse.Namespace(
-        checkpoint=str(checkpoint),
-        crop_size=config.crop_size,
-        train_mode=config.train_mode,
-        mask_mode=config.mask_mode,
-        diffusion_only=False,
-        num_steps=config.num_inference_steps,
-        seed=config.seed,
-        variant="preflight_same_seed_a",
-    )
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    first = evaluate(config, eval_args, device, max_clips=args.eval_clips)
-    eval_args.variant = "preflight_same_seed_b"
-    second = evaluate(config, eval_args, device, max_clips=args.eval_clips)
-    if first["aggregate"] != second["aggregate"]:
-        raise AssertionError("Same-seed real-weight evaluation metrics are not identical.")
-    eval_args.seed = config.seed + 1
-    eval_args.variant = "preflight_different_seed"
-    different = evaluate(config, eval_args, device, max_clips=args.eval_clips)
-    if first["aggregate"] == different["aggregate"]:
-        raise AssertionError("Different-seed real-weight evaluation metrics did not change.")
+    if checkpoint is not None:
+        eval_args = argparse.Namespace(
+            checkpoint=str(checkpoint),
+            crop_size=config.crop_size,
+            train_mode=config.train_mode,
+            mask_mode=config.mask_mode,
+            diffusion_only=False,
+            num_steps=config.num_inference_steps,
+            seed=config.seed,
+            variant="preflight_same_seed_a",
+        )
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        first = evaluate(config, eval_args, device, max_clips=args.eval_clips)
+        eval_args.variant = "preflight_same_seed_b"
+        second = evaluate(config, eval_args, device, max_clips=args.eval_clips)
+        if first["aggregate"] != second["aggregate"]:
+            raise AssertionError("Same-seed real-weight evaluation metrics are not identical.")
+        eval_args.seed = config.seed + 1
+        eval_args.variant = "preflight_different_seed"
+        different = evaluate(config, eval_args, device, max_clips=args.eval_clips)
+        if first["aggregate"] == different["aggregate"]:
+            raise AssertionError("Different-seed real-weight evaluation metrics did not change.")
+        determinism = {
+            "status": "measured",
+            "clips": args.eval_clips,
+            "same_seed": config.seed,
+            "different_seed": config.seed + 1,
+            "same_seed_metrics_identical": True,
+            "different_seed_metrics_differ": True,
+            "same_seed_aggregate": first["aggregate"],
+            "different_seed_aggregate": different["aggregate"],
+        }
+    else:
+        determinism = {
+            "status": "not_run_before_first_checkpoint",
+            "reason": "Checkpoint-dependent evaluation is deferred until trained weights exist.",
+        }
 
     weights = loss_weights(config)
     active_losses = {
@@ -402,21 +448,14 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
         "config": config.to_dict(),
         "dataset_sizes": sizes,
         "sequence_overlaps": overlaps,
+        "numerics_mismatch_warnings": numerics_mismatches,
         "reference_integrity": integrity,
         "active_losses": active_losses,
         "trainable_parameters": timing_runtime["parameter_counts"],
         "environment": environment,
         "timing_and_cost": timing,
         "checkpoint_storage": storage,
-        "determinism": {
-            "clips": args.eval_clips,
-            "same_seed": config.seed,
-            "different_seed": config.seed + 1,
-            "same_seed_metrics_identical": True,
-            "different_seed_metrics_differ": True,
-            "same_seed_aggregate": first["aggregate"],
-            "different_seed_aggregate": different["aggregate"],
-        },
+        "determinism": determinism,
     }
     _banner("COST ESTIMATE")
     print(json.dumps({"timing_and_cost": timing, "checkpoint_storage": storage}, indent=2))
@@ -427,7 +466,11 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True, help="Real Accelerate checkpoint for timing/eval.")
+    parser.add_argument(
+        "--checkpoint",
+        default="",
+        help="Optional Accelerate checkpoint. Omit before the first training run.",
+    )
     parser.add_argument("--dataset-root", default="")
     parser.add_argument("--project-root", default="/content/drive/MyDrive/TRDN_REVIDE")
     parser.add_argument("--max-train-steps", type=int, default=0)
@@ -448,6 +491,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-clips", type=int, default=3)
     parser.add_argument("--warmup-steps", type=int, default=3)
     parser.add_argument("--timed-steps", type=int, default=10)
+    parser.add_argument("--preset", default="", help="Filled numerics YAML preset.")
     return parser
 
 
