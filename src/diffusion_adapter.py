@@ -1,0 +1,206 @@
+import math
+from typing import Any, Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .assertions import assert_image, assert_latents, assert_mask, assert_temporal_memory
+from .runtime import apply_channels_last, configure_torch_backends
+
+
+def resolve_frozen_dtype(mixed_precision: str, device: str) -> torch.dtype:
+    if torch.device(device).type != "cuda":
+        return torch.float32
+    if mixed_precision == "fp16":
+        return torch.float16
+    if mixed_precision == "bf16":
+        return torch.bfloat16
+    return torch.float32
+
+
+def normalize_to_neg_one_to_one(x: torch.Tensor) -> torch.Tensor:
+    return x * 2.0 - 1.0
+
+
+def unnormalize_to_zero_to_one(x: torch.Tensor) -> torch.Tensor:
+    return (x + 1.0) / 2.0
+
+
+class TemporalConditioningAdapter(nn.Module):
+    """Project dense temporal/reference features to Stable Diffusion cross-attention tokens."""
+
+    def __init__(
+        self,
+        memory_dim: int = 64,
+        reference_dim: int = 64,
+        cross_attention_dim: int = 768,
+        adapter_dim: int = 256,
+        num_tokens: int = 16,
+    ):
+        super().__init__()
+        side = int(math.sqrt(num_tokens))
+        if side * side != num_tokens:
+            raise ValueError("num_tokens must be a perfect square")
+        self.encoder = nn.Sequential(
+            nn.Conv2d(memory_dim + reference_dim, adapter_dim, 3, padding=1),
+            nn.GroupNorm(16, adapter_dim),
+            nn.SiLU(),
+            nn.Conv2d(adapter_dim, adapter_dim, 3, padding=1),
+            nn.GroupNorm(16, adapter_dim),
+            nn.SiLU(),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((side, side))
+        self.proj = nn.Sequential(nn.LayerNorm(adapter_dim), nn.Linear(adapter_dim, cross_attention_dim))
+        self.token_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, temporal_memory: torch.Tensor, reference_feature: torch.Tensor) -> torch.Tensor:
+        assert_temporal_memory(temporal_memory, name="temporal_memory")
+        assert_temporal_memory(reference_feature, batch=temporal_memory.shape[0], name="reference_feature")
+        x = self.encoder(torch.cat([temporal_memory, reference_feature], dim=1))
+        tokens = self.pool(x).flatten(2).transpose(1, 2)
+        return self.proj(tokens) * self.token_scale
+
+
+def load_diffusion_backbone(config: Any, device: str = "cuda") -> Dict[str, Any]:
+    from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler, UNet2DConditionModel
+    from transformers import CLIPTextModel, CLIPTokenizer
+
+    configure_torch_backends(config)
+    frozen_dtype = resolve_frozen_dtype(config.mixed_precision, device)
+    # Trainable parameters must remain FP32 when using AMP/GradScaler.
+    # Loading the trainable UNet directly as FP16 causes:
+    # "ValueError: Attempting to unscale FP16 gradients."
+    unet_dtype = torch.float32 if (config.train_unet or config.enable_lora) else frozen_dtype
+    tokenizer = CLIPTokenizer.from_pretrained(config.sd_model_id, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(config.sd_model_id, subfolder="text_encoder", torch_dtype=frozen_dtype).to(device)
+    vae = AutoencoderKL.from_pretrained(config.sd_model_id, subfolder="vae", torch_dtype=frozen_dtype).to(device)
+    unet = UNet2DConditionModel.from_pretrained(config.sd_model_id, subfolder="unet", torch_dtype=unet_dtype).to(device)
+    noise_scheduler = DDPMScheduler.from_pretrained(config.sd_model_id, subfolder="scheduler")
+    inference_scheduler = DDIMScheduler.from_pretrained(config.sd_model_id, subfolder="scheduler")
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet.requires_grad_(config.train_unet and not config.enable_lora)
+    lora_report = None
+    if config.enable_lora:
+        lora_report = enable_lora_for_unet(
+            unet,
+            rank=config.lora_rank,
+            alpha=config.lora_alpha,
+            dropout=config.lora_dropout,
+        )
+    for param in unet.parameters():
+        if param.requires_grad:
+            param.data = param.data.float()
+    if config.enable_unet_gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+    attention_backend = config.attention_backend
+    if not config.enable_xformers_if_available and attention_backend == "xformers":
+        attention_backend = "sdpa"
+    if attention_backend == "xformers":
+        try:
+            unet.enable_xformers_memory_efficient_attention()
+        except Exception as exc:
+            raise RuntimeError("xformers attention was requested but could not be enabled.") from exc
+    elif attention_backend == "sdpa":
+        if not hasattr(unet, "set_default_attn_processor"):
+            raise RuntimeError("PyTorch SDPA was requested but this U-Net cannot set its default attention processor.")
+        unet.set_default_attn_processor()
+    else:
+        raise ValueError(f"Unsupported attention_backend={attention_backend!r}")
+    apply_channels_last([unet, vae], config.channels_last)
+    if config.enable_torch_compile and hasattr(torch, "compile"):
+        try:
+            unet = torch.compile(unet)
+        except Exception as exc:
+            raise RuntimeError("torch.compile was requested for the U-Net but compilation failed.") from exc
+    return {
+        "tokenizer": tokenizer,
+        "text_encoder": text_encoder,
+        "vae": vae,
+        "unet": unet,
+        "noise_scheduler": noise_scheduler,
+        "inference_scheduler": inference_scheduler,
+        "lora_report": lora_report,
+        "attention_backend": attention_backend,
+        "compile_enabled": bool(config.enable_torch_compile),
+    }
+
+
+def get_text_embeddings(tokenizer: Any, text_encoder: Any, batch_size: int, prompt: str = "a clear clean dehazed video frame") -> torch.Tensor:
+    tokens = tokenizer(
+        [prompt] * batch_size,
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        return text_encoder(tokens.input_ids.to(text_encoder.device))[0]
+
+
+def encode_images_to_latents(vae: Any, images: torch.Tensor) -> torch.Tensor:
+    assert_image(images, name="images")
+    dtype = next(vae.parameters()).dtype
+    images = normalize_to_neg_one_to_one(images).to(device=vae.device, dtype=dtype)
+    latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
+    assert_latents(latents, images)
+    return latents
+
+
+def decode_latents_to_images(vae: Any, latents: torch.Tensor) -> torch.Tensor:
+    assert_latents(latents)
+    dtype = next(vae.parameters()).dtype
+    latents = latents.to(device=vae.device, dtype=dtype) / vae.config.scaling_factor
+    images = vae.decode(latents).sample.float()
+    return unnormalize_to_zero_to_one(images).clamp(0, 1)
+
+
+def prepare_inpainting_inputs(vae: Any, noisy_latents: torch.Tensor, mask: torch.Tensor, masked_image: torch.Tensor) -> torch.Tensor:
+    assert_latents(noisy_latents, masked_image, name="noisy_latents")
+    assert_mask(mask, masked_image)
+    assert_image(masked_image, name="masked_image")
+    latent_h, latent_w = noisy_latents.shape[-2:]
+    mask_latent = F.interpolate(mask.float(), size=(latent_h, latent_w), mode="nearest").to(
+        noisy_latents.device, noisy_latents.dtype
+    )
+    masked_latents = encode_images_to_latents(vae, masked_image).to(noisy_latents.dtype)
+    return torch.cat([noisy_latents, mask_latent, masked_latents], dim=1)
+
+
+def estimate_x0_from_epsilon(noise_scheduler: Any, noisy_latents: torch.Tensor, timesteps: torch.Tensor, noise_pred: torch.Tensor) -> torch.Tensor:
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(noisy_latents.device, noisy_latents.dtype)
+    sqrt_alpha = alphas_cumprod[timesteps].sqrt().view(-1, 1, 1, 1)
+    sqrt_one_minus = (1.0 - alphas_cumprod[timesteps]).sqrt().view(-1, 1, 1, 1)
+    return (noisy_latents - sqrt_one_minus * noise_pred) / (sqrt_alpha + 1e-8)
+
+
+def enable_lora_for_unet(unet: Any, rank: int = 8, alpha: int = 16, dropout: float = 0.0) -> dict:
+    """Attach PEFT LoRA adapters to Stable Diffusion UNet attention projections."""
+    from peft import LoraConfig
+
+    for param in unet.parameters():
+        param.requires_grad_(False)
+    target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
+    lora_config = LoraConfig(
+        r=rank,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        init_lora_weights="gaussian",
+        target_modules=target_modules,
+    )
+    unet.add_adapter(lora_config)
+    total = sum(param.numel() for param in unet.parameters())
+    trainable = sum(param.numel() for param in unet.parameters() if param.requires_grad)
+    report = {
+        "enabled": True,
+        "rank": rank,
+        "alpha": alpha,
+        "dropout": dropout,
+        "target_modules": target_modules,
+        "total_parameters": total,
+        "trainable_parameters": trainable,
+        "trainable_percent": 100.0 * trainable / max(total, 1),
+    }
+    print("LoRA enabled:", report)
+    return report
