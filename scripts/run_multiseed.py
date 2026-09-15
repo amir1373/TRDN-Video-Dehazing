@@ -6,8 +6,11 @@ from pathlib import Path
 import numpy as np
 
 def summarise(values: list[float]) -> dict[str, float]:
+    from scipy.stats import t
+    if len(values) < 2 or not np.isfinite(values).all():
+        raise ValueError("Confidence intervals require at least two finite seed results")
     mean = float(np.mean(values)); std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
-    critical = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776}.get(len(values), 1.96)
+    critical = float(t.ppf(0.975, df=len(values) - 1))
     return {"mean": mean, "std": std, "ci95": critical * std / sqrt(len(values)) if values else 0.0}
 
 def main() -> None:
@@ -17,6 +20,10 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=5); parser.add_argument("--temporal-hidden-dim", type=int, default=64)
     parser.add_argument("--disable-transformer", action="store_true"); parser.add_argument("--disable-flow", action="store_true")
     args = parser.parse_args(); root = Path(args.output_root); results = []
+    if len(set(args.seeds)) != len(args.seeds) or len(args.seeds) < 2:
+        parser.error("Provide at least two distinct seeds")
+    if args.disable_transformer and args.disable_flow:
+        parser.error("Choose one ablation per experiment")
     for seed in args.seeds:
         project = root / f"seed_{seed}"; command = [sys.executable, "scripts/train_colab.py", "--dataset-root", args.dataset_root, "--project-root", str(project), "--num-epochs", str(args.num_epochs), "--seed", str(seed), "--seq-len", str(args.seq_len), "--temporal-hidden-dim", str(args.temporal_hidden_dim)]
         if args.disable_transformer: command.append("--no-transformer")

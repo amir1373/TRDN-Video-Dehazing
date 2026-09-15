@@ -153,7 +153,7 @@ def build_temporal_modules(
     temporal_memory = TemporalMemoryModule(hidden_dim=config.temporal_hidden_dim).to(device)
     temporal_transformer = (
         TemporalRetrievalTransformer(
-            memory_dim=64,
+            memory_dim=config.temporal_hidden_dim,
             token_dim=config.transformer_token_dim,
             num_layers=config.transformer_num_layers,
             num_heads=config.transformer_num_heads,
@@ -164,7 +164,7 @@ def build_temporal_modules(
         else None
     )
     reference_selector = ReferenceSelectionModule(num_references=config.seq_len - 1, memory_dim=config.temporal_hidden_dim).to(device)
-    conditioning_adapter = TemporalConditioningAdapter(cross_attention_dim=cross_attention_dim, num_tokens=16).to(device)
+    conditioning_adapter = TemporalConditioningAdapter(memory_dim=config.temporal_hidden_dim, cross_attention_dim=cross_attention_dim, num_tokens=16).to(device)
     return temporal_memory, temporal_transformer, reference_selector, conditioning_adapter
 
 
