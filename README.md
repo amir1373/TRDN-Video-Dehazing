@@ -1,5 +1,9 @@
 # Temporal Reference-Guided Diffusion Network (TRDN) for Video Dehazing
 
+For sequential GPU training through complete paper figures and SSH/tmux operation,
+see [RunPod automation](docs/RUNPOD_AUTOMATION.md) and the automatic-completion
+section of [the RunPod notebook](notebooks/TRDN_REVIDE_RunPod.ipynb).
+
 Research code for **Temporal Reference-Guided Diffusion Network for Video Dehazing using REVIDE**.
 
 TRDN reconstructs a clean current frame from a hazy 10-frame sequence:

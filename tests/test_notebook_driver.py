@@ -69,15 +69,18 @@ def test_runpod_notebook_has_ordered_detached_workflow():
     headings = [
         "".join(cell["source"]).splitlines()[0]
         for cell in cells
-        if cell["cell_type"] == "markdown"
+        if cell["cell_type"] == "markdown" and not cell.get("metadata", {}).get("automatic_completion")
     ]
     assert [heading.split(".", 1)[0] for heading in headings] == [
         f"# {letter}" for letter in "ABCDEFGHIJKLMNOPQ"
     ]
     assert "/workspace" in "".join(cells[1]["source"])
     assert "/workspace" not in "\n".join(
-        "".join(cell["source"]) for cell in cells[2:]
+        "".join(cell["source"]) for cell in cells[2:] if not cell.get("metadata", {}).get("automatic_completion")
     )
+    assert 'runpod_complete.py' in combined
+    assert 'RUN_COMPLETE_WORKFLOW = False' in combined
+    assert 'tmux attach -t trdn' in combined
     assert "launch-training" in combined
     assert "--resume-if-interrupted" in combined
     assert '"list"' in combined and '"monitor"' in combined and '"stop"' in combined
