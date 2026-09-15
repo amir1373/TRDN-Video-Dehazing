@@ -68,6 +68,7 @@ class TRDNConfig:
     use_raft_alignment: bool = True
     freeze_raft: bool = True
     use_temporal_transformer: bool = True
+    temporal_hidden_dim: int = 64
     transformer_num_layers: int = 4
     transformer_num_heads: int = 8
     transformer_token_dim: int = 256

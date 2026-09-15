@@ -212,6 +212,24 @@ The notebook includes dedicated debug cells for:
 
 Run `notebooks/DATASET_INSPECTOR.ipynb` before training to verify REVIDE sequence discovery, frame counts, and image sizes.
 
+## Controlled Temporal Ablations
+
+Do not use a single run to rank temporal modules. `scripts/run_multiseed.py` runs fixed seeds and writes mean, standard deviation, and 95% confidence intervals from actual checkpoints. The spatial transformer in `src/temporal_transformer.py` uses a grid of patch tokens and applies attention across time per patch; it does not reduce a full frame to one global temporal token.
+
+Keep the following fixed across every comparison: dataset split, image size, sequence length, optimizer schedule, training steps, and `temporal_hidden_dim`. For sequence-length robustness, repeat the protocol at `--seq-len 3`, `5`, and `7` before making generalization claims.
+
+```bash
+python scripts/run_multiseed.py \
+  --dataset-root /content/drive/MyDrive/REVIDE_sequences \
+  --output-root /content/drive/MyDrive/TRDN_REVIDE/ablations/hybrid \
+  --seeds 7 19 31 \
+  --num-epochs 30 \
+  --seq-len 5 \
+  --temporal-hidden-dim 64
+```
+
+Use `--disable-transformer` for the ConvLSTM-only control and `--disable-flow` to quantify flow-free behavior. These tools produce evidence; they do not fabricate the empirical results required for a paper revision.
+
 ## Training Modes
 
 `src/config.py` exposes:

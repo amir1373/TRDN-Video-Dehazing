@@ -150,7 +150,7 @@ def build_temporal_modules(
 ]:
     if config.model_variant == "diffusion_only":
         return None, None, None, None
-    temporal_memory = TemporalMemoryModule(hidden_dim=64).to(device)
+    temporal_memory = TemporalMemoryModule(hidden_dim=config.temporal_hidden_dim).to(device)
     temporal_transformer = (
         TemporalRetrievalTransformer(
             memory_dim=64,
@@ -163,7 +163,7 @@ def build_temporal_modules(
         if config.use_temporal_transformer
         else None
     )
-    reference_selector = ReferenceSelectionModule(num_references=config.seq_len - 1).to(device)
+    reference_selector = ReferenceSelectionModule(num_references=config.seq_len - 1, memory_dim=config.temporal_hidden_dim).to(device)
     conditioning_adapter = TemporalConditioningAdapter(cross_attention_dim=cross_attention_dim, num_tokens=16).to(device)
     return temporal_memory, temporal_transformer, reference_selector, conditioning_adapter
 

@@ -73,9 +73,11 @@ class TemporalRetrievalTransformer(nn.Module):
         memory_tokens = F.adaptive_avg_pool2d(temporal_memory, (self.pool_size, self.pool_size))
         memory_tokens = self.memory_to_token(memory_tokens.flatten(2).transpose(1, 2)).unsqueeze(1)
 
+        # Preserve an explicit patch grid. Each spatial patch attends across its
+        # own temporal trajectory rather than collapsing a whole frame to one token.
         tokens = frame_tokens + memory_tokens + self.temporal_embedding[:, :seq_len] + self.spatial_embedding
-        encoded = self.encoder(tokens.reshape(batch, seq_len * self.pool_size * self.pool_size, -1))
-        encoded = self.out_norm(encoded).reshape(batch, seq_len, self.pool_size * self.pool_size, -1)
+        encoded = self.encoder(tokens.permute(0, 2, 1, 3).reshape(batch * self.pool_size * self.pool_size, seq_len, -1))
+        encoded = self.out_norm(encoded).reshape(batch, self.pool_size * self.pool_size, seq_len, -1).permute(0, 2, 1, 3)
 
         current = encoded[:, -1].transpose(1, 2).reshape(batch, -1, self.pool_size, self.pool_size)
         enhanced = self.memory_decoder(current)

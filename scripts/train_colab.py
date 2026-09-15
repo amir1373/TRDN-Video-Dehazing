@@ -32,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mask-mode", default="auto")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--seq-len", type=int, default=10)
+    parser.add_argument("--temporal-hidden-dim", type=int, default=64)
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -97,6 +98,7 @@ def main():
         mask_mode=args.mask_mode,
         seed=args.seed,
         seq_len=args.seq_len,
+        temporal_hidden_dim=args.temporal_hidden_dim,
         crop_size=args.crop_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
