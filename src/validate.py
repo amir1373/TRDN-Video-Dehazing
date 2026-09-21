@@ -126,6 +126,9 @@ def infer_dehazed_batch(
 
     return {
         "prediction": decode_latents_to_images(diffusion["vae"], latents),
+        # Exposed so the predicted latents can be cached for decoder adaptation. Existing
+        # callers read ["prediction"] and are unaffected.
+        "latents": latents,
         "warped_refs": warped_refs,
         "flows": flows,
         "reference_weights": ref["weights"],
