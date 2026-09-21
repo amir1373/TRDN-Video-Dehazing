@@ -42,6 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preset", default="", help="Filled numerics YAML preset.")
     parser.add_argument("--enable-ema", action="store_true")
     parser.add_argument("--ema-decay", type=float, default=0.9999)
+    # Loss-weight overrides. These are NOT in the numerics preset (which carries only the
+    # 8 measured perf keys) and were previously unreachable from the CLI, so w_lpips stayed
+    # at 0.05 while LPIPS was the weakest metric (0.215 test vs a 0.066 ceiling).
+    parser.add_argument("--w-lpips", type=float, default=None)
+    parser.add_argument("--w-l1", type=float, default=None)
+    parser.add_argument("--w-flow", type=float, default=None)
     parser.add_argument(
         "--lr-schedule",
         choices=["constant", "warmup_cosine"],
@@ -120,6 +126,11 @@ def main():
         guidance_scale=args.guidance_scale,
         text_prompt=args.text_prompt,
     )
+    for _name in ("w_lpips", "w_l1", "w_flow"):
+        _val = getattr(args, _name, None)
+        if _val is not None:
+            setattr(config, _name, _val)
+            print("loss weight override: %s = %s" % (_name, _val))
     if args.preset:
         apply_numerics_preset(config, args.preset)
     if args.dataset_root:
