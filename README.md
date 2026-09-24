@@ -86,7 +86,7 @@ TemporalConditioningAdapter -> Stable Diffusion inpainting cross-attention token
 Clean current-frame reconstruction
 ```
 
-The repository also includes a clean placeholder for a future **Temporal Retrieval Transformer** version.
+The **Temporal Retrieval Transformer** is implemented in `src/temporal_transformer.py` and runs in the full pipeline above; only the diffusion-only baseline skips it.
 
 ## Dataset Setup
 
