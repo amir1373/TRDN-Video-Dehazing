@@ -163,9 +163,78 @@ def build_temporal_modules(
         if config.use_temporal_transformer
         else None
     )
-    reference_selector = ReferenceSelectionModule(num_references=config.seq_len - 1, memory_dim=config.temporal_hidden_dim).to(device)
+    reference_selector = ReferenceSelectionModule(
+        num_references=config.seq_len - 1,
+        memory_dim=config.temporal_hidden_dim,
+        logit_cap=config.selector_logit_cap,
+    ).to(device)
     conditioning_adapter = TemporalConditioningAdapter(memory_dim=config.temporal_hidden_dim, cross_attention_dim=cross_attention_dim, num_tokens=16).to(device)
     return temporal_memory, temporal_transformer, reference_selector, conditioning_adapter
+
+
+# accelerator.save_state writes models in accelerator.prepare order; for the full variant that is
+# unet, temporal_memory, temporal_transformer, reference_selector, conditioning_adapter.
+FULL_VARIANT_CHECKPOINT_FILES = (
+    ("unet", "model"),
+    ("temporal_memory", "model_1"),
+    ("temporal_transformer", "model_2"),
+    ("reference_selector", "model_3"),
+    ("conditioning_adapter", "model_4"),
+)
+
+
+def _load_checkpoint_state_file(checkpoint_dir: Path, stem: str) -> Dict[str, torch.Tensor]:
+    safetensors_path = checkpoint_dir / f"{stem}.safetensors"
+    if safetensors_path.is_file():
+        from safetensors.torch import load_file
+
+        state = load_file(str(safetensors_path), device="cpu")
+    else:
+        bin_path = checkpoint_dir / ("pytorch_model.bin" if stem == "model" else f"pytorch_{stem}.bin")
+        if not bin_path.is_file():
+            raise FileNotFoundError(f"No {stem}.safetensors or {bin_path.name} in {checkpoint_dir}")
+        state = torch.load(str(bin_path), map_location="cpu")
+    return {key.replace("_orig_mod.", "").removeprefix("module."): value for key, value in state.items()}
+
+
+def warm_start_from_checkpoint(config: TRDNConfig, modules: Dict[str, torch.nn.Module | None]) -> Dict[str, Any]:
+    """Load module weights by name from a full-variant checkpoint before accelerator.prepare.
+
+    Only weights are loaded: the optimizer, LR schedule, step counter and run directory all
+    start fresh, so the source run is never written to. init_skip_modules entries may name a
+    whole module ("reference_selector") or a parameter prefix inside one
+    ("temporal_transformer.reference_prior"); those parameters keep their random init.
+    Every other parameter must load exactly (strict key match), or this raises.
+    """
+    checkpoint_dir = Path(config.init_weights_from)
+    if not checkpoint_dir.is_dir():
+        raise FileNotFoundError(f"init_weights_from is not a directory: {checkpoint_dir}")
+    skip = [item.strip() for item in config.init_skip_modules.split(",") if item.strip()]
+    report: Dict[str, Any] = {"source": str(checkpoint_dir.resolve()), "skipped": skip, "modules": {}}
+    for name, stem in FULL_VARIANT_CHECKPOINT_FILES:
+        module = modules.get(name)
+        if module is None:
+            report["modules"][name] = "absent in this variant"
+            continue
+        if name in skip:
+            report["modules"][name] = "kept random init"
+            continue
+        target = getattr(module, "_orig_mod", module)
+        state = _load_checkpoint_state_file(checkpoint_dir, stem)
+        prefixes = [item[len(name) + 1 :] for item in skip if item.startswith(name + ".")]
+        kept_random = [key for key in state if any(key.startswith(prefix) for prefix in prefixes)]
+        for key in kept_random:
+            state.pop(key)
+        own_keys = set(target.state_dict().keys())
+        missing = sorted(own_keys - set(state) - set(kept_random))
+        unexpected = sorted(set(state) - own_keys)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Warm start of {name} from {stem}: missing={missing[:5]} unexpected={unexpected[:5]}"
+            )
+        target.load_state_dict(state, strict=False)
+        report["modules"][name] = {"loaded_tensors": len(state), "kept_random": kept_random}
+    return report
 
 
 def build_optimizer(config: TRDNConfig, unet, temporal_memory, temporal_transformer, reference_selector, conditioning_adapter):
@@ -357,6 +426,7 @@ def forward_window_prediction(
         "warped_refs": warped_refs,
         "flows": flows,
         "weights": ref["weights"],
+        "selector_entropy": ref["entropy"],
         "weighted_reference": ref["weighted_reference"],
         "current": current,
     }
@@ -464,6 +534,12 @@ def compute_training_loss(
                 warped_refs, current, current_out["weights"]
             ),
         }
+        if "selector_entropy" in current_out:
+            weights = current_out["weights"]
+            # Logged every step so the selector's behaviour during training is on record.
+            parts["sel_entropy"] = current_out["selector_entropy"]
+            parts["sel_w_adjacent"] = weights[:, -1].mean().detach()
+            parts["sel_w_older_max"] = weights[:, :-1].mean(dim=(0, 2, 3)).max().detach()
         if config.w_reference != 0.0:
             parts["reference"] = loss_bundle.reference_preservation_loss(
                 pred_img, current_out["weighted_reference"], mask
@@ -519,7 +595,7 @@ def _step_metric_record(
         scalar = float(value.detach().cpu())
         return scalar if math.isfinite(scalar) else None
 
-    loss_names = ("diffusion", "l1", "lpips", "temporal", "flow", "reference")
+    loss_names = ("diffusion", "l1", "lpips", "temporal", "flow", "reference", "sel_entropy", "sel_w_adjacent", "sel_w_older_max")
     learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
     record: Dict[str, Any] = {
         "event": "step",
@@ -612,6 +688,23 @@ def train_trdn(config: TRDNConfig) -> Dict[str, Any]:
     temporal_memory, temporal_transformer, reference_selector, conditioning_adapter = build_temporal_modules(
         config, diffusion["unet"].config.cross_attention_dim, device
     )
+    warm_start_report: Dict[str, Any] | None = None
+    if config.init_weights_from:
+        if config.resume_from_checkpoint:
+            raise ValueError("Use either init_weights_from or resume_from_checkpoint, not both.")
+        warm_start_report = warm_start_from_checkpoint(
+            config,
+            {
+                "unet": diffusion["unet"],
+                "temporal_memory": temporal_memory,
+                "temporal_transformer": temporal_transformer,
+                "reference_selector": reference_selector,
+                "conditioning_adapter": conditioning_adapter,
+            },
+        )
+        print("Warm start:", json.dumps(warm_start_report, indent=2, default=str))
+        if accelerator.is_main_process:
+            write_json(run_dir / "warm_start.json", warm_start_report)
     loss_bundle = LossBundle(device=device)
     optimizer = build_optimizer(
         config,
@@ -1119,6 +1212,9 @@ def train_trdn(config: TRDNConfig) -> Dict[str, Any]:
                 "loss_temporal",
                 "loss_flow",
                 "loss_reference",
+                "loss_sel_entropy",
+                "loss_sel_w_adjacent",
+                "loss_sel_w_older_max",
                 "total_loss",
                 "lr",
             ]

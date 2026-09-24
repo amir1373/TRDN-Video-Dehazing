@@ -540,6 +540,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--selector-logit-cap",
+        type=float,
+        default=None,
+        help="Defaults to the value saved in the checkpoint metadata (0 = uncapped).",
+    )
+    parser.add_argument(
         "--debug-max-clips",
         type=int,
         default=0,
@@ -595,7 +601,13 @@ def main() -> None:
         guidance_scale=guidance_scale,
         text_prompt=text_prompt,
         enable_ema=args.use_ema,
+        selector_logit_cap=float(
+            args.selector_logit_cap
+            if args.selector_logit_cap is not None
+            else saved_metadata.get("selector_logit_cap", 0.0)
+        ),
     )
+    print(f"selector_logit_cap = {config.selector_logit_cap}")
     if args.preset:
         apply_numerics_preset(config, args.preset)
     config.apply_model_variant()

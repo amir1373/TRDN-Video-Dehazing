@@ -7,9 +7,10 @@ from .assertions import assert_reference_weights, assert_temporal_memory, assert
 class ReferenceSelectionModule(nn.Module):
     """Learn per-pixel reliability weights over warped reference frames."""
 
-    def __init__(self, num_references: int = 9, memory_dim: int = 64, feature_dim: int = 64):
+    def __init__(self, num_references: int = 9, memory_dim: int = 64, feature_dim: int = 64, logit_cap: float = 0.0):
         super().__init__()
         self.num_references = num_references
+        self.logit_cap = float(logit_cap)
         self.ref_encoder = nn.Sequential(
             nn.Conv2d(3, feature_dim, 3, padding=1),
             nn.GroupNorm(8, feature_dim),
@@ -45,7 +46,11 @@ class ReferenceSelectionModule(nn.Module):
             if tuple(prior_logits.shape) != tuple(logits.shape):
                 raise ValueError(f"prior_logits must match reference logits {tuple(logits.shape)}, got {tuple(prior_logits.shape)}")
             logits = logits + prior_logits
+        if self.logit_cap > 0:
+            logits = self.logit_cap * torch.tanh(logits / self.logit_cap)
         weights = torch.softmax(logits, dim=1)
+        # Mean per-pixel entropy of the weights over the reference axis (nats; max ln 9).
+        entropy = -(weights * torch.log(weights.clamp_min(1e-12))).sum(dim=1).mean()
         assert_reference_weights(weights, seq_len=self.num_references + 1)
         weighted_reference = (weights.unsqueeze(2) * warped_refs).sum(dim=1)
         reference_feature = self.out_proj((weights.unsqueeze(2) * ref_feats).sum(dim=1))
@@ -54,4 +59,5 @@ class ReferenceSelectionModule(nn.Module):
             "weighted_reference": weighted_reference,
             "reference_feature": reference_feature,
             "logits": logits,
+            "entropy": entropy,
         }

@@ -54,6 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="constant",
     )
     parser.add_argument("--lr-warmup-steps", type=int, default=0)
+    # Retraining experiments (2026-09); see the matching fields in src/config.py.
+    parser.add_argument("--init-weights-from", default="", help="Full-variant checkpoint dir to warm-start weights from.")
+    parser.add_argument("--init-skip-modules", default="", help="Comma-separated modules/prefixes kept at random init.")
+    parser.add_argument("--selector-logit-cap", type=float, default=0.0)
+    parser.add_argument("--w-selector-entropy", type=float, default=0.0)
+    parser.add_argument("--validate-every", type=int, default=500, help="Set above the run length to skip validation.")
+    parser.add_argument("--checkpoint-every", type=int, default=250)
     parser.add_argument("--enable-linear-lr-scaling", action="store_true")
     parser.add_argument("--lr-reference-batch-size", type=int, default=1)
     parser.add_argument("--validation-num-samples", type=int, default=32)
@@ -125,6 +132,12 @@ def main():
         early_stopping_patience=args.early_stopping_patience,
         guidance_scale=args.guidance_scale,
         text_prompt=args.text_prompt,
+        init_weights_from=args.init_weights_from,
+        init_skip_modules=args.init_skip_modules,
+        selector_logit_cap=args.selector_logit_cap,
+        w_selector_entropy=args.w_selector_entropy,
+        validate_every=args.validate_every,
+        checkpoint_every=args.checkpoint_every,
     )
     for _name in ("w_lpips", "w_l1", "w_flow"):
         _val = getattr(args, _name, None)

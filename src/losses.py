@@ -101,4 +101,7 @@ def weighted_total_loss(config: Any, parts: dict) -> torch.Tensor:
         total = total + config.w_flow * parts["flow"]
     if "reference" in parts:
         total = total + config.w_reference * parts["reference"]
+    w_entropy = float(getattr(config, "w_selector_entropy", 0.0))
+    if w_entropy > 0 and "sel_entropy" in parts:
+        total = total - w_entropy * parts["sel_entropy"]
     return total

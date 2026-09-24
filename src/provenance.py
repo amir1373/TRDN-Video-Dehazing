@@ -20,6 +20,7 @@ LOSS_WEIGHT_FIELDS = (
     "w_temporal",
     "w_flow",
     "w_reference",
+    "w_selector_entropy",
 )
 NUMERICS_FIELDS = (
     "mixed_precision",
@@ -201,6 +202,10 @@ def checkpoint_metadata(
         "numerics": numerics_settings(config),
         "model_variant": model_variant_settings(config),
         "config_fingerprint": config_fingerprint(config),
+        # Architecture-affecting: evaluation must rebuild the selector with the same cap.
+        "selector_logit_cap": float(getattr(config, "selector_logit_cap", 0.0)),
+        "init_weights_from": str(getattr(config, "init_weights_from", "")),
+        "init_skip_modules": str(getattr(config, "init_skip_modules", "")),
         "quality_settings": {
             "text_prompt": config.text_prompt,
             "guidance_scale": config.guidance_scale,

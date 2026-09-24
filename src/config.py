@@ -127,6 +127,22 @@ class TRDNConfig:
     # Set explicitly to 0.05 to reproduce legacy reconstruct_synthetic runs.
     w_reference: float = 0.0
 
+    # Retraining experiments (2026-09). Every default is "off", so runs 1-3 are reproduced
+    # exactly when these are left unset.
+    # init_weights_from: a checkpoint of the FULL variant whose module weights are loaded by
+    # name before training (fresh optimizer, fresh run directory, step counter from zero).
+    # Unlike resume_from_checkpoint it never writes into the source run's directory, and it
+    # works for variants with fewer modules.
+    init_weights_from: str = ""
+    # Comma-separated module names to leave at their random initialisation, e.g.
+    # "reference_selector" to re-learn the selector from scratch.
+    init_skip_modules: str = ""
+    # >0 bounds the selector logits to [-cap, +cap] with cap*tanh(logits/cap), so the softmax
+    # cannot saturate (a logit gap of 2*cap bounds the weight ratio at exp(2*cap)).
+    selector_logit_cap: float = 0.0
+    # >0 adds -w * H(selector weights) to the loss, rewarding non-degenerate weights.
+    w_selector_entropy: float = 0.0
+
     resume_from_checkpoint: str = ""
     allow_mode_mismatch: bool = False
     allow_output_collision: bool = False
