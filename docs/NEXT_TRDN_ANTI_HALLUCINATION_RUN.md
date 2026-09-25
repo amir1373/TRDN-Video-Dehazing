@@ -349,3 +349,47 @@ For best information per GPU dollar:
 8. V11 / R2 / M2 only after the cheaper experiments establish the direction.
 
 Do not combine multiple untested changes into one first run. Every first-pass experiment should have a matched control, fixed seeds, identical data split, and identical evaluator.
+
+# SELECTED 10-EXPERIMENT BATCH — RUN NEXT
+
+This section is the authoritative next-run plan. Claude should implement and execute these **10 experiments next**. Lower-priority experiments elsewhere in this document are ideas only and are **not part of this batch**.
+
+Use separate output directories/checkpoint names. Do not overwrite Run2, V1, or prior retraining artifacts. Use the corrected reproducibility/seeding protocol and the same fixed evaluation protocol for matched comparisons.
+
+If sufficient A40s are available, launch independent experiments in parallel. Record actual steps/sec and wall time after the first 100-200 steps so the planning estimates can be replaced by measured values.
+
+| # | ID | Model | Experiment | A40 planning time |
+|---:|---|---|---|---:|
+| 1 | H1 | TRDN | Add clean-x0 latent MSE fidelity loss, initialized from Run2, low-LR warmup+cosine continuation | ~3.5-4.0 h |
+| 2 | V8 | VideoEENet | Replace `sigmoid(residual + current)` with identity-preserving logit-space residual output | ~1.0-1.5 h |
+| 3 | V9 | VideoEENet | Replace pure L1 with PSNR-oriented `MSE + 0.1 * L1` | ~1.0-1.5 h |
+| 4 | V8+V9 | VideoEENet | Combine identity-preserving residual output with MSE+L1 objective | ~1.0-1.5 h |
+| 5 | M1 | TRDN | Replace all-ones conditioning mask with learned soft haze-severity map predicted from hazy input | ~3.8-4.5 h |
+| 6 | R1-VE | VideoEENet | Search previous 30 causal frames, precompute descriptors/top-K, feed best 8-9 references | ~1.2-2.0 h |
+| 7 | R1-TRDN | TRDN | Same causal top-K retrieval, then existing RAFT/alignment/temporal/selector path | ~3.8-4.5 h |
+| 8 | V10 | VideoEENet | Explicit frozen-RAFT alignment to current frame before ConvLSTM temporal fusion | ~2-3 h |
+| 9 | H3 | TRDN | Combine clean-x0 latent fidelity with explicit RGB MSE fidelity; otherwise match H1 protocol | ~3.5-4.1 h |
+| 10 | V11 | VideoEENet | Full dual-domain EENet-style encoder/decoder with temporal bottleneck and current-frame multiscale skips | ~2-4 h |
+
+## Required controls and reporting
+
+For every experiment:
+
+- Preserve the relevant baseline and run directory.
+- Use input-side information only for retrieval/mask inference at validation/test time.
+- No clean-GT information may be used to choose references at validation/test time.
+- Use scene-disjoint validation for model selection where applicable; keep the Test split untouched until final scoring.
+- Report PSNR, SSIM, LPIPS where supported, temporal metric(s), per-scene PSNR, and delta versus the matched baseline.
+- Record parameter count and measured inference/training throughput for architectural variants.
+- Save configuration, commit SHA, seed, checkpoint path, and evaluator settings with results.
+- Do not silently combine extra changes beyond the experiment definition.
+
+## Parallel launch plan
+
+These ten runs are the next priority batch. With one dedicated A40 per experiment, expected wall-clock completion is governed by M1/R1-TRDN at roughly **4-5 hours**, assuming top-K retrieval is precomputed and no infrastructure bottleneck occurs.
+
+H1 and H3 may run concurrently because they are separate controlled variants. V8, V9, and V8+V9 may also run concurrently as three distinct ablations, provided their code/config differences are explicit and preserved.
+
+## Stop condition
+
+After all ten finish, generate one comparison table and rank **experimental results by measured PSNR only** for research analysis; do not launch the lower-priority roadmap automatically. Review the ten-run results first before spending GPU time on H2/H4/H5, patch retrieval, M2 physics, or 512x512 training.
