@@ -554,3 +554,20 @@ If you use this research code, cite the project and REVIDE dataset. A formal Bib
   note={Research code}
 }
 ```
+
+## Controlled-experiment options (branch `retrain-2026-09`)
+
+Added for the thesis's controlled experiments; every option defaults to off, so earlier runs are
+reproduced unchanged.
+
+| `train_colab.py` flag | effect |
+|---|---|
+| `--init-weights-from DIR` | load module weights by name from a full-variant checkpoint before training (fresh optimizer, fresh run directory; the source run is never written to) |
+| `--init-skip-modules a,b.c` | keep these modules or parameter prefixes at random init, e.g. `reference_selector,temporal_transformer.reference_prior` to reset the selector |
+| `--selector-logit-cap C` | bound the selection logits to ±C with `C·tanh(z/C)`; saved in checkpoint metadata and read back by `evaluate_full_test.py` |
+| `--w-selector-entropy W` | subtract `W·H(selector weights)` from the loss |
+| `--validate-every N`, `--checkpoint-every N` | set above the run length to train to a fixed schedule and keep only the final checkpoint |
+
+The selector's mean entropy, adjacent-frame weight and largest older-frame weight are logged at
+every step in `metrics.jsonl`. `evaluate_full_test.py` also evaluates diffusion-only checkpoints
+saved as safetensors.
