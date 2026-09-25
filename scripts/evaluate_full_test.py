@@ -77,8 +77,17 @@ def _load_unet_only_checkpoint(unet: torch.nn.Module, checkpoint_path: str, devi
             "Diffusion-only evaluation could not find the first Accelerate model state "
             f"in {checkpoint}. Expected one of: {', '.join(path.name for path in candidates)}"
         )
-    state = load(str(model_path), map_location=device)
-    unet.load_state_dict(state, strict=True)
+    if model_path.suffix == ".safetensors":
+        # accelerate.utils.load goes through torch.load, which cannot read safetensors
+        # (and refuses it under the weights_only default of PyTorch >= 2.6).
+        from safetensors.torch import load_file
+
+        state = load_file(str(model_path), device=str(device))
+    else:
+        state = load(str(model_path), map_location=device)
+    # A torch.compile'd U-Net is saved with an "_orig_mod." prefix; load into the plain module.
+    state = {key.replace("_orig_mod.", ""): value for key, value in state.items()}
+    getattr(unet, "_orig_mod", unet).load_state_dict(state, strict=True)
 
 
 def load_runtime_for_eval(
