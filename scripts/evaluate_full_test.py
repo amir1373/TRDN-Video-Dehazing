@@ -107,6 +107,11 @@ def load_runtime_for_eval(
     if diffusion_only:
         if checkpoint_path:
             _load_unet_only_checkpoint(diffusion["unet"], checkpoint_path, device)
+            # Same mixed-precision wrapping as the full-variant path below: the trainable U-Net
+            # is held in fp32 and must run under the fp16 autocast the frozen modules use.
+            from accelerate import Accelerator
+
+            diffusion["unet"] = Accelerator(mixed_precision=config.mixed_precision).prepare(diffusion["unet"])
     else:
         temporal_memory, temporal_transformer, reference_selector, conditioning_adapter = build_temporal_modules(
             config, diffusion["unet"].config.cross_attention_dim, device
