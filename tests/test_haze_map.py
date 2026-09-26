@@ -30,3 +30,21 @@ def test_estimator_starts_near_all_ones_and_has_own_optimizer_group():
     assert [g["lr"] for g in opt.param_groups][-1] == 1e-4
     est_ids = {id(p) for p in haze_estimator_of(adapter).parameters()}
     assert all(id(p) not in est_ids for p in opt.param_groups[0]["params"])
+
+
+def test_warm_start_leaves_a_new_skipped_submodule_at_its_init(tmp_path):
+    from safetensors.torch import save_file
+
+    from src.train import warm_start_from_checkpoint
+
+    plain = TRDNConfig()
+    memory, transformer, selector, adapter = build_temporal_modules(plain, 768, "cpu")
+    for stem, module in (("model_1", memory), ("model_2", transformer), ("model_3", selector), ("model_4", adapter)):
+        save_file({k: v.contiguous() for k, v in module.state_dict().items()}, str(tmp_path / f"{stem}.safetensors"))
+    config = TRDNConfig(haze_map_conditioning=True, init_weights_from=str(tmp_path),
+                        init_skip_modules="conditioning_adapter.haze_estimator")
+    m2, t2, s2, a2 = build_temporal_modules(config, 768, "cpu")
+    report = warm_start_from_checkpoint(config, {"unet": None, "temporal_memory": m2, "temporal_transformer": t2,
+                                                 "reference_selector": s2, "conditioning_adapter": a2})
+    assert report["modules"]["conditioning_adapter"]["loaded_tensors"] > 0
+    assert float(haze_estimator_of(a2)(torch.rand(1, 3, 32, 32)).min()) > 0.97

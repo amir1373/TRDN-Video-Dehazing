@@ -271,7 +271,11 @@ def warm_start_from_checkpoint(config: TRDNConfig, modules: Dict[str, torch.nn.M
         for key in kept_random:
             state.pop(key)
         own_keys = set(target.state_dict().keys())
-        missing = sorted(own_keys - set(state) - set(kept_random))
+        # Parameters under a skipped prefix may be new (absent from the source checkpoint).
+        missing = sorted(
+            key for key in own_keys - set(state) - set(kept_random)
+            if not any(key.startswith(prefix) for prefix in prefixes)
+        )
         unexpected = sorted(set(state) - own_keys)
         if missing or unexpected:
             raise RuntimeError(
