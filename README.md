@@ -571,3 +571,23 @@ reproduced unchanged.
 The selector's mean entropy, adjacent-frame weight and largest older-frame weight are logged at
 every step in `metrics.jsonl`. `evaluate_full_test.py` also evaluates diffusion-only checkpoints
 saved as safetensors.
+
+## Further options (2026-09-25/26)
+
+All default to off; with none set, training and evaluation behave exactly as before.
+
+| option (`scripts/train_colab.py`) | effect |
+|---|---|
+| `--learning-rate`, `--temporal-learning-rate` | override the UNet / temporal-module learning rates (e.g. a low-rate continuation) |
+| `--w-latent-x0 W`, `--latent-x0-min-snr-gamma G` | MSE between predicted and target clean latent, Min-SNR-weighted (`src/losses.py`) |
+| `--w-rgb-mse W` | MSE on the decoded one-step estimate |
+| `--haze-map-conditioning` (+ `--init-skip-modules conditioning_adapter.haze_estimator`) | learned haze-severity map in place of the all-ones inpainting mask (`src/haze_map.py`) |
+| `--retrieval-index FILE` | references retrieved from up to 30 earlier frames (`src/retrieval.py`, `scripts/build_retrieval_index.py`) |
+| `--train-mode occlude`, `--occlusion-coverage-min/max`, `--occlusion-scope lens\|current\|mixed` | opaque occluders over real hazy windows (`src/occlusion.py`) |
+| `--occlusion-reference-fill` | fill occluded pixels of the conditioning image with the warped selected reference |
+
+Training is now seeded (Python, NumPy, PyTorch, DataLoader). `scripts/evaluate_full_test.py`
+gains `--train-mode occlude --occlusion-coverage C --occlusion-scope S`, `--retrieval-index`, and
+`--save-predictions FILE.npz`; every evaluation now records per-window PSNR/SSIM/LPIPS.
+`scripts/occlusion_baselines.py` scores the SD-inpainting and RAFT-fill baselines on the same
+occluded windows.
