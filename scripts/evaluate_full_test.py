@@ -193,6 +193,7 @@ def build_test_dataset(config: TRDNConfig, args: argparse.Namespace) -> REVIDESe
             getattr(args, "occlusion_coverage", 0.35) if args.train_mode == "occlude" else None
         ),
         occlusion_scope=getattr(args, "occlusion_scope", "lens"),
+        retrieval_index=getattr(args, "retrieval_index", "") or None,
     )
 
 
@@ -607,6 +608,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="occlude mode: fraction of each test crop hidden by the (deterministic) occluder.",
     )
     parser.add_argument("--occlusion-scope", choices=["lens", "current"], default="lens")
+    parser.add_argument("--retrieval-index", default="", help="R1: evaluate with retrieved references.")
     parser.add_argument("--save-predictions", default="", help="Write every prediction (uint8 HWC) to this .npz, keyed by the resolved target-frame path.")
     parser.add_argument(
         "--model-variant",

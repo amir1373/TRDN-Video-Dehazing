@@ -67,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--occlusion-scope", choices=["lens", "current", "mixed"], default="mixed")
     parser.add_argument("--w-latent-x0", type=float, default=0.0)
     parser.add_argument("--w-rgb-mse", type=float, default=0.0)
+    parser.add_argument("--retrieval-index", default="", help="R1: retrieval index JSON (empty = preceding frames)")
     parser.add_argument("--haze-map-conditioning", action="store_true")
     parser.add_argument("--w-haze-map", type=float, default=1.0)
     parser.add_argument("--haze-map-learning-rate", type=float, default=1e-4)
@@ -153,6 +154,7 @@ def main():
         occlusion_scope=args.occlusion_scope,
         w_latent_x0=args.w_latent_x0,
         w_rgb_mse=args.w_rgb_mse,
+        retrieval_index=args.retrieval_index,
         haze_map_conditioning=args.haze_map_conditioning,
         w_haze_map=args.w_haze_map,
         haze_map_learning_rate=args.haze_map_learning_rate,

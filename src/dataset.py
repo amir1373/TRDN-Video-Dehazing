@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import os
 import random
 import re
 from pathlib import Path
@@ -13,6 +14,7 @@ from torch.utils.data import Dataset
 from .haze import simulate_realistic_haze
 from .masks import generate_haze_mask
 from .occlusion import apply_occluder, occluder_key, occluder_mask, seeded_occluder_mask
+from .retrieval import clean_path_for, load_index
 
 CLEAN_DIR_NAMES = {"gt", "GT", "clean", "Clean", "clear", "Clear", "target", "targets", "groundtruth", "ground_truth"}
 HAZY_DIR_NAMES = {"hazy", "Hazy", "input", "Input", "inputs", "fog", "Fog", "degraded", "Degraded"}
@@ -253,6 +255,7 @@ class REVIDESequenceDataset(Dataset):
         occlusion_coverage_max: float = 0.65,
         occlusion_eval_coverage: Optional[float] = None,
         occlusion_scope: str = "lens",
+        retrieval_index: Optional[str] = None,
     ):
         self.root = Path(root)
         self.split = split
@@ -287,6 +290,9 @@ class REVIDESequenceDataset(Dataset):
         if occlusion_scope not in ("lens", "current", "mixed"):
             raise ValueError(f"Unknown occlusion_scope: {occlusion_scope}")
         self.occlusion_scope = occlusion_scope
+        # R1: when set, each window's nine references are the retrieved ones (src/retrieval.py)
+        # instead of the nine preceding frames; the target frame is unchanged.
+        self.retrieval = load_index(retrieval_index) if retrieval_index else None
 
         # Predictive temporal-consistency training (see src/losses.py) needs the
         # previous frame's own T-length window so a genuine "previous frame
@@ -606,7 +612,46 @@ class REVIDESequenceDataset(Dataset):
             "warped_references": frames[:-1].clone().float(),
         }
 
+    def _retrieved_pairs(self, sequence: Dict[str, Any], end_idx: int) -> List[Tuple[str, str]]:
+        """(hazy, clean) paths of the window ending at end_idx, with retrieved references."""
+        target_hazy = str(sequence["hazy_files"][end_idx])
+        refs = self.retrieval.get(os.path.realpath(target_hazy)) if self.retrieval is not None else None
+        if refs is None or len(refs) != self.seq_len - 1:
+            start = end_idx - self.seq_len + 1
+            return [(str(h), str(c)) for h, c in zip(sequence["hazy_files"][start : end_idx + 1], sequence["clean_files"][start : end_idx + 1])]
+        return [(ref, clean_path_for(ref)) for ref in refs] + [(target_hazy, str(sequence["clean_files"][end_idx]))]
+
+    def _getitem_retrieved(self, idx: int) -> Dict[str, Any]:
+        seq_idx, end_idx = self.index[idx]
+        sequence = self.sequences[seq_idx]
+        windows = [self._retrieved_pairs(sequence, end_idx)]
+        if self.needs_prev_frame:
+            windows.append(self._retrieved_pairs(sequence, end_idx - 1))
+        pairs = [pair for window in windows for pair in window]
+        hazy_all = torch.stack([image_to_tensor(Path(h)) for h, _ in pairs], dim=0)
+        clean_all = torch.stack([image_to_tensor(Path(c)) for _, c in pairs], dim=0)
+        hazy_all, clean_all, *_ = self._crop_pair(hazy_all, clean_all)   # one crop for both windows
+        hazy_frames, clean_frames = hazy_all[: self.seq_len], clean_all[: self.seq_len]
+        sample = self._build_window(hazy_frames, clean_frames)
+        sample.update({
+            "clean_frames": clean_frames.float(), "hazy_frames": hazy_frames.float(),
+            "train_mode": self.train_mode, "sequence_name": sequence["name"],
+            "frame_paths": [h for h, _ in windows[0]],
+        })
+        if self.needs_prev_frame:
+            prev = self._build_window(hazy_all[self.seq_len :], clean_all[self.seq_len :])
+            sample["prev_frames"] = prev["frames"]
+            sample["prev_current_frame"] = prev["current_frame"]
+            sample["prev_target_frame"] = prev["target_frame"]
+            sample["prev_mask"] = prev["mask"]
+            sample["prev_corrupted_frame"] = prev["corrupted_frame"]
+        return sample
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if self.retrieval is not None and self.index:
+            if self.train_mode != "dehaze":
+                raise ValueError("Retrieved references are implemented for dehaze mode only.")
+            return self._getitem_retrieved(idx)
         clip = self._load_real_clip(idx) if self.index else self._load_synthetic_clip(idx)
         hazy_frames, clean_frames = clip["hazy_frames"], clip["clean_frames"]
 

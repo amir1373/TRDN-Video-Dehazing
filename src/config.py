@@ -164,6 +164,8 @@ class TRDNConfig:
     haze_map_conditioning: bool = False
     w_haze_map: float = 1.0
     haze_map_learning_rate: float = 1e-4
+    # R1: path of a retrieval index (scripts/build_retrieval_index.py); empty = nine preceding frames.
+    retrieval_index: str = ""
 
     resume_from_checkpoint: str = ""
     allow_mode_mismatch: bool = False

@@ -73,6 +73,7 @@ def make_datasets(
         occlusion_coverage_min=config.occlusion_coverage_min,
         occlusion_coverage_max=config.occlusion_coverage_max,
         occlusion_scope=config.occlusion_scope,
+        retrieval_index=config.retrieval_index or None,
     )
     val_dataset = REVIDESequenceDataset(
         config.root_for_split(config.val_split),
@@ -97,6 +98,7 @@ def make_datasets(
             else None
         ),
         occlusion_scope="lens" if config.occlusion_scope == "mixed" else config.occlusion_scope,
+        retrieval_index=config.retrieval_index or None,
     )
     if validate_structure:
         train_dataset.assert_valid_structure("train")
