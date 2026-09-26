@@ -59,6 +59,15 @@ def seeded_occluder_mask(height: int, width: int, coverage: float, key: str) -> 
         np.random.set_state(np_state)
 
 
+def occluder_key(target_frame_path: str) -> str:
+    """Evaluation key shared by both models: the last three components of the resolved hazy
+    target-frame path (REVIDE_TRDN symlinks to REVIDE_sequences, so both resolve alike)."""
+    import os
+    from pathlib import Path
+
+    return "/".join(Path(os.path.realpath(target_frame_path)).parts[-3:])
+
+
 def apply_occluder(frames: torch.Tensor, mask: torch.Tensor, fill: float = OCCLUDER_FILL) -> torch.Tensor:
     """Replace occluded pixels of [..., 3, H, W] frames with `fill`; mask is [1, H, W]."""
     return frames * (1.0 - mask) + fill * mask

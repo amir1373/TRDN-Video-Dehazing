@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 
 from .haze import simulate_realistic_haze
 from .masks import generate_haze_mask
-from .occlusion import apply_occluder, occluder_mask, seeded_occluder_mask
+from .occlusion import apply_occluder, occluder_key, occluder_mask, seeded_occluder_mask
 
 CLEAN_DIR_NAMES = {"gt", "GT", "clean", "Clean", "clear", "Clear", "target", "targets", "groundtruth", "ground_truth"}
 HAZY_DIR_NAMES = {"hazy", "Hazy", "input", "Input", "inputs", "fog", "Fog", "degraded", "Degraded"}
@@ -626,7 +626,7 @@ class REVIDESequenceDataset(Dataset):
         scope = self.occlusion_scope
         if self.train_mode == "occlude":
             occluder = self._occluder_for(
-                clean_frames.shape[-2], clean_frames.shape[-1], f"{clip['name']}:{idx}"
+                clean_frames.shape[-2], clean_frames.shape[-1], occluder_key(clip["paths"][-1])
             )
             if scope == "mixed":
                 scope = random.choice(("lens", "current"))
