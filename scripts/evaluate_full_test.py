@@ -43,6 +43,7 @@ from src.ema import load_ema_weights
 from src.flow import flow_warped_temporal_consistency_error, load_raft
 from src.losses import LossBundle
 from src.metrics import psnr_metric, ssim_metric
+from src.occlusion import occluder_key
 from src.presets import apply_numerics_preset
 from src.progress import ProgressReporter
 from src.provenance import (
@@ -276,6 +277,10 @@ def evaluate(
     all_coverage: List[float] = []
     total_frames = 0
     occlude_mode = getattr(args, "train_mode", "dehaze") == "occlude"
+    # Optional: keep every prediction (uint8, keyed by the resolved target-frame path) so that
+    # sample averaging, routing and blending can be analysed offline without re-running.
+    saved_predictions: Dict[str, np.ndarray] = {}
+    save_predictions = bool(getattr(args, "save_predictions", ""))
 
     evaluated_seq_indices = sorted(by_clip)
     if max_clips is not None:
@@ -350,6 +355,11 @@ def evaluate(
 
                 prediction = output["prediction"]
                 target = batch["target_frame"]
+                if save_predictions:
+                    key = occluder_key(sample["frame_paths"][-1])
+                    saved_predictions[key] = (
+                        prediction[0].detach().float().clamp(0, 1).mul(255).round().byte().permute(1, 2, 0).cpu().numpy()
+                    )
                 clip_psnr.append(psnr_metric(prediction[0], target[0]))
                 clip_ssim.append(ssim_metric(prediction[0], target[0]))
                 clip_lpips.append(float(loss_bundle.lpips_loss(prediction, target).detach().cpu()))
@@ -477,6 +487,10 @@ def evaluate(
         checkpoint_metadata = load_checkpoint_metadata(args.checkpoint) if args.checkpoint else {}
     except FileNotFoundError:
         checkpoint_metadata = {}
+    if save_predictions:
+        out_path = Path(args.save_predictions)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(out_path, **{k.replace("/", "|"): v for k, v in saved_predictions.items()})
     return {
         "schema_version": 2,
         "variant": getattr(args, "variant", "") or (
@@ -593,6 +607,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="occlude mode: fraction of each test crop hidden by the (deterministic) occluder.",
     )
     parser.add_argument("--occlusion-scope", choices=["lens", "current"], default="lens")
+    parser.add_argument("--save-predictions", default="", help="Write every prediction (uint8 HWC) to this .npz, keyed by the resolved target-frame path.")
     parser.add_argument(
         "--model-variant",
         choices=["full", "no_raft", "no_transformer", "diffusion_only"],
