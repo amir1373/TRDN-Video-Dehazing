@@ -1,22 +1,18 @@
 # Temporal Reference-Guided Diffusion Network (TRDN) for Video Dehazing
 
-For sequential GPU training through complete paper figures and SSH/tmux operation,
-see [RunPod automation](docs/RUNPOD_AUTOMATION.md) and the automatic-completion
-section of [the RunPod notebook](notebooks/TRDN_REVIDE_RunPod.ipynb).
+Developed by Amir Moshtaghioun (University of Regina) for the MASc thesis *Temporal modelling for
+real-world video dehazing: A protocol-matched evaluation of recurrent regression and latent
+diffusion*.
 
-Research code for **Temporal Reference-Guided Diffusion Network for Video Dehazing using REVIDE**.
-
-TRDN reconstructs a clean current frame from a hazy 10-frame sequence:
+TRDN reconstructs a clean current frame from a hazy 10-frame sequence of the REVIDE benchmark:
 
 ```text
 [frame(t-9), ..., frame(t-1), frame(t)] -> clean frame(t)
 ```
 
-The paid-run workflow is `notebooks/TRDN_REVIDE_RunPod.ipynb`. It is an
-ordered A-Q driver for environment checks, dataset validation, the VAE ceiling,
-preflight, measured A40 benchmarking, numerics locking, four detached training
-runs, evaluation, final figures, tables, and the download bundle. The older
-Colab notebook remains available for development.
+Training and evaluation can be driven from `notebooks/TRDN_REVIDE_RunPod.ipynb` (a GPU server),
+`notebooks/TRDN_REVIDE_Colab.ipynb` (Google Colab) or the scripts below; all research logic lives
+in `src/`.
 
 ## Notebook / Repository Synchronization
 
@@ -34,28 +30,9 @@ The notebook is the execution interface, not a second implementation. All major 
 
 Future code changes should be made in `src/` first. The notebook should remain limited to setup, configuration, visualization, debugging, and launch cells.
 
-## RunPod Paid Run
-
-Edit only cell A in `notebooks/TRDN_REVIDE_RunPod.ipynb`, then execute in
-order. Stop at cell G to review measured cost and benchmark results. Cell H
-requires the explicit `LOCK_A40` confirmation before it writes a runnable
-`configs/a40.yaml`.
-
-The four training cells launch detached jobs through
-`scripts/runpod_workflow.py` and `scripts/runpod_jobs.py`. Their logs and job
-state live under each run directory, so cell J can be interrupted and rerun
-without affecting training. The variants are independently trained `full`,
-`no_raft`, `no_transformer`, and `diffusion_only`; the last constructs only
-the diffusion U-Net and uses diffusion, L1, and LPIPS losses.
-
-Cell O writes one shared seeded sample-selection JSON before generating any
-qualitative output. Every paper figure has PNG, PDF, and provenance sidecar
-outputs. Cell Q refuses an incomplete artifact set and creates the archive
-that should be downloaded before ending the pod.
-
 ## Research Motivation
 
-Single-image dehazing often loses temporal information that is available in video. TRDN V1 uses previous hazy frames as temporal references, aligns them to the current frame with optical flow, learns which aligned references are reliable per pixel, and injects temporal/reference conditioning into a Stable Diffusion inpainting UNet.
+Single-image dehazing often loses temporal information that is available in video. TRDN uses previous hazy frames as temporal references, aligns them to the current frame with optical flow, learns which aligned references are reliable per pixel, and injects temporal/reference conditioning into a Stable Diffusion inpainting UNet.
 
 ## Architecture Overview
 
@@ -232,14 +209,14 @@ python scripts/run_multiseed.py \
   --temporal-hidden-dim 64
 ```
 
-Use `--disable-transformer` for the ConvLSTM-only control and `--disable-flow` to quantify flow-free behavior. These tools produce evidence; they do not fabricate the empirical results required for a paper revision.
+Use `--disable-transformer` for the ConvLSTM-only control and `--disable-flow` to quantify flow-free behavior.
 
 ## Training Modes
 
 `src/config.py` exposes:
 
 ```python
-train_mode = "dehaze"  # or "reconstruct_synthetic" (legacy alias: "reconstruct")
+train_mode = "dehaze"  # or "reconstruct_synthetic" (alias: "reconstruct")
 ```
 
 `dehaze` (default):
@@ -254,20 +231,9 @@ mask_mode  = "full" (all-ones; full-frame restoration through the SD inpainting 
 This is the actual video dehazing task and the only mode whose numbers should
 be reported as a dehazing result.
 
-`reconstruct_synthetic` (legacy name: `reconstruct`):
-
-```text
-input      = clean target frame with SYNTHETIC haze painted inside a random mask
-references = GROUND-TRUTH CLEAN frames
-target     = clean current frame
-mask_mode  = "mixed" (random rectangle/ellipse/blob/perlin occlusion, unrelated to real haze)
-```
-
-Real REVIDE haze never reaches the model in this mode, and the temporal
-references are ground truth. **This is not a dehazing evaluation.** It is
-kept only to explain/reproduce previously-reported numbers, is not the
-default, and logs a loud warning whenever it is selected. See "Evaluation
-protocol" below.
+`reconstruct_synthetic` (alias `reconstruct`) trains on synthetic masks painted over clean
+frames with clean references. It is not a dehazing task, is not used for any reported result,
+and `src/dataset.py` warns whenever it is selected.
 
 Both modes use REVIDE only.
 
@@ -276,7 +242,7 @@ Both modes use REVIDE only.
 Notebook:
 
 1. Edit the single `/workspace` configuration cell.
-2. Fill every `TODO` in `configs/a40.yaml` from the A40 benchmark.
+2. Set the batch and numerics values in `configs/a40.yaml` for your GPU.
 3. Run the dataset guard, repository setup, and dependency cells.
 4. Run preflight, training, full evaluation, figures, and tables in order.
 
@@ -309,7 +275,7 @@ Every run creates `logs/runs/<run>/run_manifest.json` and an append-only
 inventory, parameter counts, runtime environment, elapsed time, and peak GPU
 memory.
 
-Before a billed training run, execute the real-data preflight. Before the
+Before a long training run, execute the real-data preflight. Before the
 first checkpoint exists, omit `--checkpoint`:
 
 ```bash
@@ -323,7 +289,7 @@ Preflight refuses synthetic fallback, prints the discovered paired layout,
 measures a temporary checkpoint when needed, checks the retention projection
 against free disk, and writes `preflight_report.json`.
 
-Run the CPU-only orchestration smoke test before renting a GPU:
+Run the CPU-only orchestration smoke test before using a GPU:
 
 ```bash
 python scripts/smoke_test.py
@@ -361,13 +327,12 @@ test data.
 ## Evaluation Protocol
 
 - **Only `train_mode="dehaze"` measures video dehazing.** It is the default in
-  `src/config.py`. `train_mode="reconstruct_synthetic"` (legacy name
+  `src/config.py`. `train_mode="reconstruct_synthetic"` (alias
   `"reconstruct"`) uses ground-truth clean frames as temporal references and
   paints synthetic haze inside a random mask onto an otherwise-clean target;
   real REVIDE haze never reaches the model in that mode. It is **not a
-  dehazing benchmark** -- it exists only to explain/reproduce previously
-  reported numbers, and `src/dataset.py` logs a loud warning whenever it is
-  selected.
+  dehazing benchmark** -- it is not used for any reported result, and
+  `src/dataset.py` logs a warning whenever it is selected.
 - **The validation split is a held-out subset of TRAINING sequences, never
   the test set.** `src/dataset.py`'s `split_train_val_sequence_names()`
   deterministically partitions ~10% of training sequence names (by name, via
@@ -392,9 +357,7 @@ test data.
   invokes the model RAFT or any temporal model component.
 - **Determinism**: inference uses DDIM with eta=0 and a per-sample,
   per-frame-index deterministic noise generator (`src/seeding.py`), so two
-  runs with the same seed produce identical metrics. Random per-run noise
-  previously caused a 1.67 dB spread between two runs of the same
-  configuration; this is now fixed by default.
+  runs with the same seed produce identical metrics.
 - **Frame pairing**: preflight natural-sorts filenames (`frame_2` precedes
   `frame_10`) and requires positional pairs to have either identical stems or
   stems equal after removing documented modality tokens such as `hazy`,
@@ -542,23 +505,23 @@ TRDN-Video-Dehazing/
 - **VS Code cannot find `src`:** Run the notebook from the repository root or add the repo root to `sys.path`, as done in the notebook setup cell.
 - **Checkpoint loading mismatch:** Use checkpoints saved by this repository version, especially when loading with Accelerate.
 
-## Citation Placeholder
+## Citation
 
-If you use this research code, cite the project and REVIDE dataset. A formal BibTeX entry can be added after publication:
+If you use this code, please cite the thesis and the REVIDE dataset:
 
 ```bibtex
-@misc{trdn_video_dehazing,
-  title={Temporal Reference-Guided Diffusion Network for Video Dehazing},
-  author={Your Name},
-  year={2026},
-  note={Research code}
+@mastersthesis{moshtaghioun2026temporal,
+  title  = {Temporal modelling for real-world video dehazing: A protocol-matched evaluation of recurrent regression and latent diffusion},
+  author = {Moshtaghioun, Amir},
+  school = {University of Regina},
+  year   = {2026}
 }
 ```
 
 ## Controlled-experiment options (branch `retrain-2026-09`)
 
-Added for the thesis's controlled experiments; every option defaults to off, so earlier runs are
-reproduced unchanged.
+Used for the thesis's controlled experiments; every option defaults to off, so the reference runs
+are reproduced unchanged.
 
 | `train_colab.py` flag | effect |
 |---|---|
@@ -572,9 +535,9 @@ The selector's mean entropy, adjacent-frame weight and largest older-frame weigh
 every step in `metrics.jsonl`. `evaluate_full_test.py` also evaluates diffusion-only checkpoints
 saved as safetensors.
 
-## Further options (2026-09-25/26)
+## Further options
 
-All default to off; with none set, training and evaluation behave exactly as before.
+All default to off; with none set, training and evaluation behave as in the reference runs.
 
 | option (`scripts/train_colab.py`) | effect |
 |---|---|
@@ -583,11 +546,7 @@ All default to off; with none set, training and evaluation behave exactly as bef
 | `--w-rgb-mse W` | MSE on the decoded one-step estimate |
 | `--haze-map-conditioning` (+ `--init-skip-modules conditioning_adapter.haze_estimator`) | learned haze-severity map in place of the all-ones inpainting mask (`src/haze_map.py`) |
 | `--retrieval-index FILE` | references retrieved from up to 30 earlier frames (`src/retrieval.py`, `scripts/build_retrieval_index.py`) |
-| `--train-mode occlude`, `--occlusion-coverage-min/max`, `--occlusion-scope lens\|current\|mixed` | opaque occluders over real hazy windows (`src/occlusion.py`) |
-| `--occlusion-reference-fill` | fill occluded pixels of the conditioning image with the warped selected reference |
 
-Training is now seeded (Python, NumPy, PyTorch, DataLoader). `scripts/evaluate_full_test.py`
-gains `--train-mode occlude --occlusion-coverage C --occlusion-scope S`, `--retrieval-index`, and
-`--save-predictions FILE.npz`; every evaluation now records per-window PSNR/SSIM/LPIPS.
-`scripts/occlusion_baselines.py` scores the SD-inpainting and RAFT-fill baselines on the same
-occluded windows.
+Training is seeded (Python, NumPy, PyTorch, DataLoader). `scripts/evaluate_full_test.py` accepts
+`--retrieval-index` and `--save-predictions FILE.npz`, and every evaluation records per-window
+PSNR/SSIM/LPIPS.
