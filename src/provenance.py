@@ -22,6 +22,8 @@ LOSS_WEIGHT_FIELDS = (
     "w_reference",
     "w_selector_entropy",
     "w_latent_x0",
+    "w_rgb_mse",
+    "w_haze_map",
 )
 NUMERICS_FIELDS = (
     "mixed_precision",
@@ -209,6 +211,7 @@ def checkpoint_metadata(
         "config_fingerprint": config_fingerprint(config),
         # Architecture-affecting: evaluation must rebuild the selector with the same cap.
         "selector_logit_cap": float(getattr(config, "selector_logit_cap", 0.0)),
+        "haze_map_conditioning": bool(getattr(config, "haze_map_conditioning", False)),
         "init_weights_from": str(getattr(config, "init_weights_from", "")),
         "init_skip_modules": str(getattr(config, "init_skip_modules", "")),
         "quality_settings": {

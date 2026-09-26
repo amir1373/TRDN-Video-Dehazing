@@ -66,6 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--occlusion-coverage-max", type=float, default=0.65)
     parser.add_argument("--occlusion-scope", choices=["lens", "current", "mixed"], default="mixed")
     parser.add_argument("--w-latent-x0", type=float, default=0.0)
+    parser.add_argument("--w-rgb-mse", type=float, default=0.0)
+    parser.add_argument("--haze-map-conditioning", action="store_true")
+    parser.add_argument("--w-haze-map", type=float, default=1.0)
+    parser.add_argument("--haze-map-learning-rate", type=float, default=1e-4)
     parser.add_argument("--latent-x0-min-snr-gamma", type=float, default=5.0)
     parser.add_argument("--validate-every", type=int, default=500, help="Set above the run length to skip validation.")
     parser.add_argument("--checkpoint-every", type=int, default=250)
@@ -148,6 +152,10 @@ def main():
         occlusion_coverage_max=args.occlusion_coverage_max,
         occlusion_scope=args.occlusion_scope,
         w_latent_x0=args.w_latent_x0,
+        w_rgb_mse=args.w_rgb_mse,
+        haze_map_conditioning=args.haze_map_conditioning,
+        w_haze_map=args.w_haze_map,
+        haze_map_learning_rate=args.haze_map_learning_rate,
         latent_x0_min_snr_gamma=args.latent_x0_min_snr_gamma,
         validate_every=args.validate_every,
         checkpoint_every=args.checkpoint_every,

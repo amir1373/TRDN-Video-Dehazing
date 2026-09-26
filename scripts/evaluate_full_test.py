@@ -697,6 +697,7 @@ def main() -> None:
             if args.selector_logit_cap is not None
             else saved_metadata.get("selector_logit_cap", 0.0)
         ),
+        haze_map_conditioning=bool(saved_metadata.get("haze_map_conditioning", False)),
     )
     print(f"selector_logit_cap = {config.selector_logit_cap}")
     if args.preset:

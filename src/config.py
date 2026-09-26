@@ -156,6 +156,14 @@ class TRDNConfig:
     # min(SNR, gamma) (Min-SNR weighting, Hang et al. 2023), bounding the effective weight.
     w_latent_x0: float = 0.0
     latent_x0_min_snr_gamma: float = 5.0
+    # >0 adds an MSE between the decoded one-step clean estimate and the clean target (H3).
+    w_rgb_mse: float = 0.0
+    # M1: replace the all-ones inpainting mask by a haze-severity map predicted from the hazy
+    # frame (src/haze_map.py), supervised with a scattering-model pseudo-target at w_haze_map
+    # and trained in its own optimizer group at haze_map_learning_rate.
+    haze_map_conditioning: bool = False
+    w_haze_map: float = 1.0
+    haze_map_learning_rate: float = 1e-4
 
     resume_from_checkpoint: str = ""
     allow_mode_mismatch: bool = False

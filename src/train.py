@@ -26,6 +26,7 @@ from .dataset import REVIDESequenceDataset
 from .diffusion_adapter import estimate_x0_from_epsilon, get_text_embeddings, prepare_inpainting_inputs, decode_latents_to_images, encode_images_to_latents
 from .ema import EMAState
 from .flow import compute_warped_references_batch, load_raft
+from .haze_map import HazeMapEstimator, pseudo_haze_severity
 from .losses import LossBundle, latent_x0_min_snr_loss, weighted_total_loss
 from .provenance import (
     JsonlMetricLogger,
@@ -204,7 +205,16 @@ def build_temporal_modules(
         logit_cap=config.selector_logit_cap,
     ).to(device)
     conditioning_adapter = TemporalConditioningAdapter(memory_dim=config.temporal_hidden_dim, cross_attention_dim=cross_attention_dim, num_tokens=16).to(device)
+    if getattr(config, "haze_map_conditioning", False):
+        # Kept inside the adapter so it is saved, loaded and warm-started with it.
+        conditioning_adapter.haze_estimator = HazeMapEstimator().to(device)
     return temporal_memory, temporal_transformer, reference_selector, conditioning_adapter
+
+
+def haze_estimator_of(conditioning_adapter) -> torch.nn.Module | None:
+    module = getattr(conditioning_adapter, "_orig_mod", conditioning_adapter)
+    module = getattr(module, "module", module)
+    return getattr(module, "haze_estimator", None)
 
 
 # accelerator.save_state writes models in accelerator.prepare order; for the full variant that is
@@ -280,10 +290,16 @@ def build_optimizer(config: TRDNConfig, unet, temporal_memory, temporal_transfor
     if config.train_temporal_modules:
         if temporal_memory is None or reference_selector is None or conditioning_adapter is None:
             raise RuntimeError("Temporal training was enabled without temporal modules.")
-        temporal_params = list(temporal_memory.parameters()) + list(reference_selector.parameters()) + list(conditioning_adapter.parameters())
+        estimator = haze_estimator_of(conditioning_adapter)
+        estimator_ids = {id(p) for p in estimator.parameters()} if estimator is not None else set()
+        adapter_params = [p for p in conditioning_adapter.parameters() if id(p) not in estimator_ids]
+        temporal_params = list(temporal_memory.parameters()) + list(reference_selector.parameters()) + adapter_params
         if temporal_transformer is not None:
             temporal_params += list(temporal_transformer.parameters())
         groups.append({"params": temporal_params, "lr": temporal_learning_rate})
+        if estimator is not None:
+            # A freshly initialised module: its own group, so a low continuation LR does not starve it.
+            groups.append({"params": list(estimator.parameters()), "lr": float(config.haze_map_learning_rate)})
     return torch.optim.AdamW(groups, weight_decay=config.weight_decay)
 
 
@@ -427,6 +443,11 @@ def forward_window_prediction(
     assert_warped_references(warped_refs, seq_len=seq_len)
 
     aligned_frames = torch.cat([warped_refs, current.unsqueeze(1)], dim=1)
+    haze_map = None
+    estimator = haze_estimator_of(conditioning_adapter)
+    if estimator is not None:
+        haze_map = estimator(current)
+        mask = haze_map.detach()      # the UNet sees the map; the map learns only from its own target
     ctx = accelerator.autocast() if autocast else nullcontext()
     with ctx:
         memory = temporal_memory(aligned_frames)
@@ -475,6 +496,7 @@ def forward_window_prediction(
         "timesteps": timesteps,
         "noise_pred": noise_pred,
         "clean_latents": latents,
+        "haze_map": haze_map,
     }
 
 
@@ -601,6 +623,12 @@ def compute_training_loss(
             parts["sel_w_adjacent"] = weights[:, -1].mean().detach()
             parts["sel_w_older_max"] = weights[:, :-1].mean(dim=(0, 2, 3)).max().detach()
         _add_latent_x0_loss(parts, current_out, diffusion, config)
+        if float(getattr(config, "w_rgb_mse", 0.0)) > 0:
+            parts["rgb_mse"] = F.mse_loss(pred_img.float(), target.float())
+        if current_out.get("haze_map") is not None:
+            severity, valid = pseudo_haze_severity(corrupted, target)
+            error = (current_out["haze_map"].float() - severity).abs() * valid
+            parts["haze_map"] = error.sum() / valid.sum().clamp(min=1.0)
         if config.w_reference != 0.0:
             parts["reference"] = loss_bundle.reference_preservation_loss(
                 pred_img, current_out["weighted_reference"], mask
@@ -656,7 +684,7 @@ def _step_metric_record(
         scalar = float(value.detach().cpu())
         return scalar if math.isfinite(scalar) else None
 
-    loss_names = ("diffusion", "l1", "lpips", "temporal", "flow", "reference", "latent_x0", "sel_entropy", "sel_w_adjacent", "sel_w_older_max")
+    loss_names = ("diffusion", "l1", "lpips", "temporal", "flow", "reference", "latent_x0", "rgb_mse", "haze_map", "sel_entropy", "sel_w_adjacent", "sel_w_older_max")
     learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
     record: Dict[str, Any] = {
         "event": "step",

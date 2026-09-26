@@ -101,6 +101,10 @@ def weighted_total_loss(config: Any, parts: dict) -> torch.Tensor:
         total = total + config.w_flow * parts["flow"]
     if "reference" in parts:
         total = total + config.w_reference * parts["reference"]
+    for name in ("rgb_mse", "haze_map"):
+        weight = float(getattr(config, f"w_{name}", 0.0))
+        if weight > 0 and name in parts:
+            total = total + weight * parts[name]
     w_latent_x0 = float(getattr(config, "w_latent_x0", 0.0))
     if w_latent_x0 > 0 and "latent_x0" in parts:
         total = total + w_latent_x0 * parts["latent_x0"]

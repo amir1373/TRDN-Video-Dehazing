@@ -60,6 +60,10 @@ def infer_dehazed_batch(
     assert_warped_references(warped_refs, seq_len=frames.shape[1])
     current = frames[:, -1]
     aligned_frames = torch.cat([warped_refs, current.unsqueeze(1)], dim=1)
+    adapter_module = getattr(conditioning_adapter, "_orig_mod", conditioning_adapter)
+    estimator = getattr(getattr(adapter_module, "module", adapter_module), "haze_estimator", None)
+    if estimator is not None:
+        mask = estimator(corrupted.to(device)).to(mask.dtype)   # M1: predicted haze-severity map
     memory = temporal_memory(aligned_frames)
     prior_logits = None
     transformer_tokens = None
