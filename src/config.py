@@ -166,6 +166,8 @@ class TRDNConfig:
     haze_map_learning_rate: float = 1e-4
     # R1: path of a retrieval index (scripts/build_retrieval_index.py); empty = nine preceding frames.
     retrieval_index: str = ""
+    # TOR: fill the occluded pixels of the conditioning image with the fused warped reference.
+    occlusion_reference_fill: bool = False
 
     resume_from_checkpoint: str = ""
     allow_mode_mismatch: bool = False

@@ -98,3 +98,20 @@ def test_current_scope_occludes_only_the_current_frame(tmp_path: Path):
     # The previous window is not occluded: the occluder is transient.
     assert float(sample["prev_mask"].sum()) == 0
     assert sample["occlusion_scope"] == "current"
+
+
+def test_reference_fill_replaces_only_hidden_pixels_and_flag_reaches_the_adapter():
+    from src.config import TRDNConfig
+    from src.occlusion import fill_with_reference
+    from src.train import build_temporal_modules
+
+    corrupted = torch.full((1, 3, 8, 8), 0.5)
+    corrupted[..., :4] = 0.2                                  # visible part
+    mask = torch.zeros(1, 1, 8, 8); mask[..., 4:] = 1.0       # right half hidden
+    reference = torch.full((1, 3, 8, 8), 0.9)
+    out = fill_with_reference(corrupted, mask, reference)
+    assert torch.all(out[..., :4] == 0.2) and torch.all(out[..., 4:] == 0.9)
+    on = build_temporal_modules(TRDNConfig(occlusion_reference_fill=True), 768, "cpu")[3]
+    off = build_temporal_modules(TRDNConfig(), 768, "cpu")[3]
+    assert on.reference_fill is True and off.reference_fill is False
+    assert not any("reference_fill" in k for k in on.state_dict())   # a flag, not a parameter

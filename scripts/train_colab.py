@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--occlusion-coverage-min", type=float, default=0.05)
     parser.add_argument("--occlusion-coverage-max", type=float, default=0.65)
     parser.add_argument("--occlusion-scope", choices=["lens", "current", "mixed"], default="mixed")
+    parser.add_argument("--occlusion-reference-fill", action="store_true", help="TOR: fill occluded pixels of the conditioning image with the fused warped reference")
     parser.add_argument("--w-latent-x0", type=float, default=0.0)
     parser.add_argument("--w-rgb-mse", type=float, default=0.0)
     parser.add_argument("--retrieval-index", default="", help="R1: retrieval index JSON (empty = preceding frames)")
@@ -152,6 +153,7 @@ def main():
         occlusion_coverage_min=args.occlusion_coverage_min,
         occlusion_coverage_max=args.occlusion_coverage_max,
         occlusion_scope=args.occlusion_scope,
+        occlusion_reference_fill=args.occlusion_reference_fill,
         w_latent_x0=args.w_latent_x0,
         w_rgb_mse=args.w_rgb_mse,
         retrieval_index=args.retrieval_index,

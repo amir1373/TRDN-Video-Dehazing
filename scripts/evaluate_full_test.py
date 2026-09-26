@@ -700,6 +700,7 @@ def main() -> None:
             else saved_metadata.get("selector_logit_cap", 0.0)
         ),
         haze_map_conditioning=bool(saved_metadata.get("haze_map_conditioning", False)),
+        occlusion_reference_fill=bool(saved_metadata.get("occlusion_reference_fill", False)),
     )
     print(f"selector_logit_cap = {config.selector_logit_cap}")
     if args.preset:

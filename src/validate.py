@@ -75,6 +75,9 @@ def infer_dehazed_batch(
     assert_temporal_memory(memory, batch=batch)
     ref = reference_selector(warped_refs, memory, prior_logits=prior_logits)
     assert_reference_weights(ref["weights"], seq_len=frames.shape[1])
+    if getattr(getattr(adapter_module, "module", adapter_module), "reference_fill", False):
+        from .occlusion import fill_with_reference
+        corrupted = fill_with_reference(corrupted.to(device), mask, ref["weighted_reference"])
     cond_tokens = conditioning_adapter(memory, ref["reference_feature"])
     text = get_text_embeddings(
         diffusion["tokenizer"],

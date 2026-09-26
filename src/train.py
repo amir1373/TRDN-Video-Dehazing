@@ -27,6 +27,7 @@ from .diffusion_adapter import estimate_x0_from_epsilon, get_text_embeddings, pr
 from .ema import EMAState
 from .flow import compute_warped_references_batch, load_raft
 from .haze_map import HazeMapEstimator, pseudo_haze_severity
+from .occlusion import fill_with_reference
 from .losses import LossBundle, latent_x0_min_snr_loss, weighted_total_loss
 from .provenance import (
     JsonlMetricLogger,
@@ -210,6 +211,8 @@ def build_temporal_modules(
     if getattr(config, "haze_map_conditioning", False):
         # Kept inside the adapter so it is saved, loaded and warm-started with it.
         conditioning_adapter.haze_estimator = HazeMapEstimator().to(device)
+    # TOR: a plain flag (no parameters), set from the config at training and from metadata at evaluation.
+    conditioning_adapter.reference_fill = bool(getattr(config, "occlusion_reference_fill", False))
     return temporal_memory, temporal_transformer, reference_selector, conditioning_adapter
 
 
@@ -482,6 +485,9 @@ def forward_window_prediction(
             0, diffusion["noise_scheduler"].config.num_train_timesteps, (latents.shape[0],), device=latents.device
         ).long()
         noisy_latents = diffusion["noise_scheduler"].add_noise(latents, noise, timesteps)
+        adapter_module = getattr(conditioning_adapter, "_orig_mod", conditioning_adapter)
+        if getattr(getattr(adapter_module, "module", adapter_module), "reference_fill", False):
+            corrupted = fill_with_reference(corrupted, mask, ref["weighted_reference"])
         model_input = prepare_inpainting_inputs(diffusion["vae"], noisy_latents, mask, corrupted)
         noise_pred = diffusion["unet"](model_input, timesteps, encoder_hidden_states=encoder_hidden_states).sample
 

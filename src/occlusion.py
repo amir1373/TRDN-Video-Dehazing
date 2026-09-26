@@ -68,6 +68,14 @@ def occluder_key(target_frame_path: str) -> str:
     return "/".join(Path(os.path.realpath(target_frame_path)).parts[-3:])
 
 
+def fill_with_reference(corrupted, mask, weighted_reference):
+    """Reference-filled conditioning (occlusion experiment TOR): the hidden pixels of the current frame
+    are replaced by TRDN's own selector-weighted, RAFT-warped reference before the image is encoded,
+    so the temporal pathway delivers pixel content where the frame has none. Visible pixels are kept."""
+    reference = weighted_reference.detach().to(corrupted.dtype)
+    return corrupted * (1.0 - mask) + reference * mask
+
+
 def apply_occluder(frames: torch.Tensor, mask: torch.Tensor, fill: float = OCCLUDER_FILL) -> torch.Tensor:
     """Replace occluded pixels of [..., 3, H, W] frames with `fill`; mask is [1, H, W]."""
     return frames * (1.0 - mask) + fill * mask
