@@ -656,7 +656,7 @@ def _step_metric_record(
         scalar = float(value.detach().cpu())
         return scalar if math.isfinite(scalar) else None
 
-    loss_names = ("diffusion", "l1", "lpips", "temporal", "flow", "reference", "sel_entropy", "sel_w_adjacent", "sel_w_older_max")
+    loss_names = ("diffusion", "l1", "lpips", "temporal", "flow", "reference", "latent_x0", "sel_entropy", "sel_w_adjacent", "sel_w_older_max")
     learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
     record: Dict[str, Any] = {
         "event": "step",
