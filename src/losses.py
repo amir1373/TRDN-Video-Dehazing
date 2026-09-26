@@ -101,7 +101,33 @@ def weighted_total_loss(config: Any, parts: dict) -> torch.Tensor:
         total = total + config.w_flow * parts["flow"]
     if "reference" in parts:
         total = total + config.w_reference * parts["reference"]
+    w_latent_x0 = float(getattr(config, "w_latent_x0", 0.0))
+    if w_latent_x0 > 0 and "latent_x0" in parts:
+        total = total + w_latent_x0 * parts["latent_x0"]
     w_entropy = float(getattr(config, "w_selector_entropy", 0.0))
     if w_entropy > 0 and "sel_entropy" in parts:
         total = total - w_entropy * parts["sel_entropy"]
     return total
+
+
+def latent_x0_min_snr_loss(
+    noise_scheduler: Any,
+    noisy_latents: torch.Tensor,
+    timesteps: torch.Tensor,
+    noise_pred: torch.Tensor,
+    clean_latents: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    """Min-SNR-weighted MSE between the predicted clean latent and the clean target latent.
+
+    Computed in float32: the x0 estimate divides by sqrt(alpha_bar), which is tiny at large t.
+    Each sample's x0 MSE is weighted by min(SNR, gamma), so the effective weight on the
+    epsilon error is min(SNR, gamma) / SNR <= 1 at every timestep.
+    """
+    alphas = noise_scheduler.alphas_cumprod.to(noisy_latents.device, torch.float32)[timesteps]
+    alphas = alphas.view(-1, 1, 1, 1)
+    pred_x0 = (noisy_latents.float() - (1.0 - alphas).sqrt() * noise_pred.float()) / alphas.sqrt()
+    per_sample = ((pred_x0 - clean_latents.detach().float()) ** 2).mean(dim=(1, 2, 3))
+    snr = (alphas / (1.0 - alphas)).view(-1)
+    weight = torch.clamp(snr, max=gamma)
+    return (weight * per_sample).mean()

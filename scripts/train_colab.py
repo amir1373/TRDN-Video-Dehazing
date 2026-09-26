@@ -20,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-from-checkpoint", default="")
     parser.add_argument("--allow-mode-mismatch", action="store_true")
     parser.add_argument("--allow-output-collision", action="store_true")
-    parser.add_argument("--train-mode", default="dehaze", choices=["dehaze", "reconstruct_synthetic"])
+    parser.add_argument("--train-mode", default="dehaze", choices=["dehaze", "occlude", "reconstruct_synthetic"])
     parser.add_argument(
         "--model-variant",
         choices=["full", "no_raft", "no_transformer", "diffusion_only"],
@@ -59,6 +59,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init-skip-modules", default="", help="Comma-separated modules/prefixes kept at random init.")
     parser.add_argument("--selector-logit-cap", type=float, default=0.0)
     parser.add_argument("--w-selector-entropy", type=float, default=0.0)
+    # Experiments of 2026-09-25 (occlusion, latent x0 fidelity, low-LR continuation).
+    parser.add_argument("--learning-rate", type=float, default=None, help="UNet learning rate override.")
+    parser.add_argument("--temporal-learning-rate", type=float, default=None, help="Temporal-module learning rate override.")
+    parser.add_argument("--occlusion-coverage-min", type=float, default=0.05)
+    parser.add_argument("--occlusion-coverage-max", type=float, default=0.65)
+    parser.add_argument("--occlusion-scope", choices=["lens", "current", "mixed"], default="mixed")
+    parser.add_argument("--w-latent-x0", type=float, default=0.0)
+    parser.add_argument("--latent-x0-min-snr-gamma", type=float, default=5.0)
     parser.add_argument("--validate-every", type=int, default=500, help="Set above the run length to skip validation.")
     parser.add_argument("--checkpoint-every", type=int, default=250)
     parser.add_argument("--enable-linear-lr-scaling", action="store_true")
@@ -136,6 +144,11 @@ def main():
         init_skip_modules=args.init_skip_modules,
         selector_logit_cap=args.selector_logit_cap,
         w_selector_entropy=args.w_selector_entropy,
+        occlusion_coverage_min=args.occlusion_coverage_min,
+        occlusion_coverage_max=args.occlusion_coverage_max,
+        occlusion_scope=args.occlusion_scope,
+        w_latent_x0=args.w_latent_x0,
+        latent_x0_min_snr_gamma=args.latent_x0_min_snr_gamma,
         validate_every=args.validate_every,
         checkpoint_every=args.checkpoint_every,
     )
@@ -146,6 +159,11 @@ def main():
             print("loss weight override: %s = %s" % (_name, _val))
     if args.preset:
         apply_numerics_preset(config, args.preset)
+    for _name in ("learning_rate", "temporal_learning_rate"):
+        _val = getattr(args, _name)
+        if _val is not None:
+            setattr(config, _name, _val)
+            print("learning-rate override: %s = %s" % (_name, _val))
     if args.dataset_root:
         config.override_dataset_root(args.dataset_root)
     print(train_trdn(config))

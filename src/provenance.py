@@ -21,6 +21,7 @@ LOSS_WEIGHT_FIELDS = (
     "w_flow",
     "w_reference",
     "w_selector_entropy",
+    "w_latent_x0",
 )
 NUMERICS_FIELDS = (
     "mixed_precision",
@@ -68,7 +69,11 @@ def git_state() -> Dict[str, Any]:
 def effective_mask_mode(train_mode: str, mask_mode: str) -> str:
     if mask_mode != "auto":
         return mask_mode
-    return "full" if train_mode == "dehaze" else "mixed"
+    if train_mode == "dehaze":
+        return "full"
+    if train_mode == "occlude":
+        return "occluder"
+    return "mixed"
 
 
 def loss_weights(config: TRDNConfig) -> Dict[str, float]:

@@ -38,7 +38,10 @@ class TRDNConfig:
     #   explain/reproduce previously-reported numbers and is NOT a dehazing
     #   evaluation. See src/dataset.py for the loud runtime warning this mode
     #   triggers.
-    train_mode: Literal["dehaze", "reconstruct_synthetic"] = "dehaze"
+    # "occlude": real hazy REVIDE windows with an opaque lens-fixed occluder over every frame
+    #   (src/occlusion.py); the mask channel marks the occluded pixels and the target is the
+    #   clean frame, so the model must dehaze everywhere and reconstruct under the occluder.
+    train_mode: Literal["dehaze", "occlude", "reconstruct_synthetic"] = "dehaze"
     model_variant: Literal[
         "full", "no_raft", "no_transformer", "diffusion_only"
     ] = "full"
@@ -142,6 +145,17 @@ class TRDNConfig:
     selector_logit_cap: float = 0.0
     # >0 adds -w * H(selector weights) to the loss, rewarding non-degenerate weights.
     w_selector_entropy: float = 0.0
+    # Occlusion experiment: training samples the occluded fraction uniformly from this range.
+    occlusion_coverage_min: float = 0.05
+    occlusion_coverage_max: float = 0.65
+    # "lens" (every frame), "current" (current frame only) or "mixed" (either, per sample).
+    occlusion_scope: str = "mixed"
+    # >0 adds an MSE between the predicted clean latent x0 and the clean target latent. Because
+    # x0 error = eps error / sqrt(SNR), an unweighted x0 MSE multiplies the eps loss by 1/SNR,
+    # which explodes at large timesteps; each sample is therefore weighted by
+    # min(SNR, gamma) (Min-SNR weighting, Hang et al. 2023), bounding the effective weight.
+    w_latent_x0: float = 0.0
+    latent_x0_min_snr_gamma: float = 5.0
 
     resume_from_checkpoint: str = ""
     allow_mode_mismatch: bool = False

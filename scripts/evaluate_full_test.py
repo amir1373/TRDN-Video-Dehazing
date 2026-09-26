@@ -21,6 +21,7 @@ sequences) is for. This script is the only place test data should be read.
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import time
@@ -187,7 +188,21 @@ def build_test_dataset(config: TRDNConfig, args: argparse.Namespace) -> REVIDESe
         mask_mode=args.mask_mode,
         include_prev_frame=False,
         include_reference_frames=config.model_variant != "diffusion_only",
+        occlusion_eval_coverage=(
+            getattr(args, "occlusion_coverage", 0.35) if args.train_mode == "occlude" else None
+        ),
+        occlusion_scope=getattr(args, "occlusion_scope", "lens"),
     )
+
+
+def _region_psnr(pred: torch.Tensor, target: torch.Tensor, region: torch.Tensor) -> Optional[float]:
+    """PSNR over the pixels where region == 1 (all three channels); None if the region is empty."""
+    weight = region.float().expand_as(target)
+    count = float(weight.sum())
+    if count < 1:
+        return None
+    mse = float((((pred.float().clamp(0, 1) - target.float().clamp(0, 1)) ** 2) * weight).sum()) / count
+    return 99.0 if mse <= 1e-12 else 20.0 * math.log10(1.0 / math.sqrt(mse))
 
 
 def group_index_by_clip(dataset: REVIDESequenceDataset) -> Dict[int, List[int]]:
@@ -256,7 +271,11 @@ def evaluate(
     all_lpips: List[float] = []
     all_temporal_error: List[float] = []
     all_temporal_coverage: List[float] = []
+    all_psnr_occluded: List[float] = []
+    all_psnr_visible: List[float] = []
+    all_coverage: List[float] = []
     total_frames = 0
+    occlude_mode = getattr(args, "train_mode", "dehaze") == "occlude"
 
     evaluated_seq_indices = sorted(by_clip)
     if max_clips is not None:
@@ -284,6 +303,7 @@ def evaluate(
         clip_name = dataset.sequences[seq_idx]["name"]
         dataset_indices = by_clip[seq_idx]  # already ascending by construction of dataset.index
         clip_psnr, clip_ssim, clip_lpips, clip_temporal_error, clip_temporal_coverage = [], [], [], [], []
+        clip_psnr_occluded, clip_psnr_visible, clip_coverage = [], [], []
         prev_prediction: Optional[torch.Tensor] = None
         clip_weight_rows = []
         try:
@@ -333,6 +353,15 @@ def evaluate(
                 clip_psnr.append(psnr_metric(prediction[0], target[0]))
                 clip_ssim.append(ssim_metric(prediction[0], target[0]))
                 clip_lpips.append(float(loss_bundle.lpips_loss(prediction, target).detach().cpu()))
+                if occlude_mode:
+                    region = batch["mask"][0]
+                    clip_coverage.append(float(region.float().mean()))
+                    occluded = _region_psnr(prediction[0], target[0], region)
+                    visible = _region_psnr(prediction[0], target[0], 1.0 - region)
+                    if occluded is not None:
+                        clip_psnr_occluded.append(occluded)
+                    if visible is not None:
+                        clip_psnr_visible.append(visible)
 
                 if prev_prediction is not None and consistency_raft is not None:
                     temporal_error, coverage = flow_warped_temporal_consistency_error(
@@ -372,7 +401,22 @@ def evaluate(
             "temporal_consistency_coverage_mean": float(np.mean(clip_temporal_coverage)) if clip_temporal_coverage else None,
             "temporal_consistency_l1_per_transition": clip_temporal_error,
             "temporal_consistency_coverage_per_transition": clip_temporal_coverage,
+            "psnr_per_window": clip_psnr,
+            "ssim_per_window": clip_ssim,
+            "lpips_per_window": clip_lpips,
         }
+        if occlude_mode:
+            clip_result.update(
+                {
+                    "psnr_occluded_mean": float(np.mean(clip_psnr_occluded)) if clip_psnr_occluded else None,
+                    "psnr_visible_mean": float(np.mean(clip_psnr_visible)) if clip_psnr_visible else None,
+                    "psnr_occluded_per_window": clip_psnr_occluded,
+                    "occlusion_coverage_per_window": clip_coverage,
+                }
+            )
+            all_psnr_occluded.extend(clip_psnr_occluded)
+            all_psnr_visible.extend(clip_psnr_visible)
+            all_coverage.extend(clip_coverage)
         per_clip_results.append(clip_result)
         all_psnr.extend(clip_psnr)
         all_ssim.extend(clip_ssim)
@@ -481,7 +525,18 @@ def evaluate(
             "lpips": _mean_std(all_lpips),
             "temporal_consistency_l1": _mean_std(all_temporal_error),
             "temporal_consistency_coverage": _mean_std(all_temporal_coverage),
+            **(
+                {
+                    "psnr_occluded": _mean_std(all_psnr_occluded),
+                    "psnr_visible": _mean_std(all_psnr_visible),
+                    "occlusion_coverage_measured": _mean_std(all_coverage),
+                }
+                if occlude_mode
+                else {}
+            ),
         },
+        "occlusion_coverage_requested": getattr(args, "occlusion_coverage", None) if occlude_mode else None,
+        "occlusion_scope": getattr(args, "occlusion_scope", None) if occlude_mode else None,
         "reference_weights_by_offset": reference_weights,
         "per_clip": per_clip_results,
     }
@@ -530,7 +585,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--seq-len", type=int, default=10)
-    parser.add_argument("--train-mode", default="dehaze", choices=["dehaze", "reconstruct_synthetic"])
+    parser.add_argument("--train-mode", default="dehaze", choices=["dehaze", "occlude", "reconstruct_synthetic"])
+    parser.add_argument(
+        "--occlusion-coverage",
+        type=float,
+        default=0.35,
+        help="occlude mode: fraction of each test crop hidden by the (deterministic) occluder.",
+    )
+    parser.add_argument("--occlusion-scope", choices=["lens", "current"], default="lens")
     parser.add_argument(
         "--model-variant",
         choices=["full", "no_raft", "no_transformer", "diffusion_only"],

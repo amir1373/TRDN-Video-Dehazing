@@ -1,5 +1,6 @@
 import json
 import math
+import random
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -25,7 +26,7 @@ from .dataset import REVIDESequenceDataset
 from .diffusion_adapter import estimate_x0_from_epsilon, get_text_embeddings, prepare_inpainting_inputs, decode_latents_to_images, encode_images_to_latents
 from .ema import EMAState
 from .flow import compute_warped_references_batch, load_raft
-from .losses import LossBundle, weighted_total_loss
+from .losses import LossBundle, latent_x0_min_snr_loss, weighted_total_loss
 from .provenance import (
     JsonlMetricLogger,
     checkpoint_metadata,
@@ -68,6 +69,9 @@ def make_datasets(
         split_seed=config.split_seed,
         include_prev_frame=config.model_variant != "diffusion_only",
         include_reference_frames=config.model_variant != "diffusion_only",
+        occlusion_coverage_min=config.occlusion_coverage_min,
+        occlusion_coverage_max=config.occlusion_coverage_max,
+        occlusion_scope=config.occlusion_scope,
     )
     val_dataset = REVIDESequenceDataset(
         config.root_for_split(config.val_split),
@@ -83,11 +87,38 @@ def make_datasets(
         split_seed=config.split_seed,
         include_prev_frame=False,  # validation only ever runs infer_dehazed_batch, which doesn't use it
         include_reference_frames=config.model_variant != "diffusion_only",
+        occlusion_coverage_min=config.occlusion_coverage_min,
+        occlusion_coverage_max=config.occlusion_coverage_max,
+        # Validation occluders are fixed so validation scores are comparable across steps.
+        occlusion_eval_coverage=(
+            0.5 * (config.occlusion_coverage_min + config.occlusion_coverage_max)
+            if config.train_mode == "occlude"
+            else None
+        ),
+        occlusion_scope="lens" if config.occlusion_scope == "mixed" else config.occlusion_scope,
     )
     if validate_structure:
         train_dataset.assert_valid_structure("train")
         val_dataset.assert_valid_structure("validation")
     return train_dataset, val_dataset
+
+
+def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy and PyTorch (CPU and CUDA) so a training seed is a real seed."""
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _seed_worker(worker_id: int) -> None:
+    import numpy as np
+
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def make_dataloaders(config: TRDNConfig) -> Tuple[DataLoader, DataLoader]:
@@ -100,10 +131,14 @@ def make_dataloaders(config: TRDNConfig) -> Tuple[DataLoader, DataLoader]:
         if config.num_workers > 0
         else {}
     )
+    generator = torch.Generator()
+    generator.manual_seed(int(config.seed))
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
+        generator=generator,
+        worker_init_fn=_seed_worker,
         num_workers=config.num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
@@ -303,7 +338,14 @@ def forward_diffusion_only_prediction(
             noise_pred,
         )
         pred_img = decode_latents_to_images(diffusion["vae"], pred_x0)
-    return {"pred_img": pred_img, "diffusion_loss": diffusion_loss}
+    return {
+        "pred_img": pred_img,
+        "diffusion_loss": diffusion_loss,
+        "noisy_latents": noisy_latents,
+        "timesteps": timesteps,
+        "noise_pred": noise_pred,
+        "clean_latents": latents,
+    }
 
 
 def effective_learning_rates(config: TRDNConfig) -> tuple[float, float]:
@@ -429,7 +471,24 @@ def forward_window_prediction(
         "selector_entropy": ref["entropy"],
         "weighted_reference": ref["weighted_reference"],
         "current": current,
+        "noisy_latents": noisy_latents,
+        "timesteps": timesteps,
+        "noise_pred": noise_pred,
+        "clean_latents": latents,
     }
+
+
+def _add_latent_x0_loss(parts, out, diffusion, config: TRDNConfig) -> None:
+    if float(getattr(config, "w_latent_x0", 0.0)) <= 0:
+        return
+    parts["latent_x0"] = latent_x0_min_snr_loss(
+        diffusion["noise_scheduler"],
+        out["noisy_latents"],
+        out["timesteps"],
+        out["noise_pred"],
+        out["clean_latents"],
+        float(config.latent_x0_min_snr_gamma),
+    )
 
 
 def compute_training_loss(
@@ -467,6 +526,7 @@ def compute_training_loss(
                 "l1": F.l1_loss(pred_img, target),
                 "lpips": loss_bundle.lpips_loss(pred_img, target),
             }
+            _add_latent_x0_loss(parts, current_out, diffusion, config)
             return weighted_total_loss(config, parts), parts
 
     if temporal_memory is None or reference_selector is None or conditioning_adapter is None:
@@ -494,7 +554,7 @@ def compute_training_loss(
 
     if not temporal_loss_enabled:
         temporal_loss = pred_img.new_zeros(())
-    elif config.train_mode == "dehaze" and "prev_frames" in batch:
+    elif config.train_mode in ("dehaze", "occlude") and "prev_frames" in batch:
         prev_frames = batch["prev_frames"].to(accelerator.device, non_blocking=True)
         prev_target = batch["prev_target_frame"].to(accelerator.device, non_blocking=True)
         prev_mask = batch["prev_mask"].to(accelerator.device, non_blocking=True)
@@ -540,6 +600,7 @@ def compute_training_loss(
             parts["sel_entropy"] = current_out["selector_entropy"]
             parts["sel_w_adjacent"] = weights[:, -1].mean().detach()
             parts["sel_w_older_max"] = weights[:, :-1].mean(dim=(0, 2, 3)).max().detach()
+        _add_latent_x0_loss(parts, current_out, diffusion, config)
         if config.w_reference != 0.0:
             parts["reference"] = loss_bundle.reference_preservation_loss(
                 pred_img, current_out["weighted_reference"], mask
@@ -639,6 +700,7 @@ def train_trdn(config: TRDNConfig) -> Dict[str, Any]:
         )
     seed_mismatches = find_seed_mismatches(Path(config.paths()["logs"]), config)
     print(f"Resolved training seed: {config.seed}")
+    seed_everything(int(config.seed))
     if seed_mismatches:
         print("=" * 88)
         print("WARNING: SEED DIFFERS FROM A SIBLING RUN")

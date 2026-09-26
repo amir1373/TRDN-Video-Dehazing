@@ -12,6 +12,7 @@ from torch.utils.data import Dataset
 
 from .haze import simulate_realistic_haze
 from .masks import generate_haze_mask
+from .occlusion import apply_occluder, occluder_mask, seeded_occluder_mask
 
 CLEAN_DIR_NAMES = {"gt", "GT", "clean", "Clean", "clear", "Clear", "target", "targets", "groundtruth", "ground_truth"}
 HAZY_DIR_NAMES = {"hazy", "Hazy", "input", "Input", "inputs", "fog", "Fog", "degraded", "Degraded"}
@@ -19,7 +20,7 @@ HAZY_DIR_NAMES = {"hazy", "Hazy", "input", "Input", "inputs", "fog", "Fog", "deg
 # "reconstruct" is the legacy name for what is now called "reconstruct_synthetic".
 # It leaks ground truth into the temporal references (see the branch below) and
 # is kept only so previously-reported numbers can be explained/reproduced.
-TRAIN_MODES = {"dehaze", "reconstruct_synthetic"}
+TRAIN_MODES = {"dehaze", "occlude", "reconstruct_synthetic"}
 _LEGACY_TRAIN_MODE_ALIASES = {"reconstruct": "reconstruct_synthetic"}
 
 logger = logging.getLogger(__name__)
@@ -248,6 +249,10 @@ class REVIDESequenceDataset(Dataset):
         split_seed: int = 1234,
         include_prev_frame: bool = True,
         include_reference_frames: bool = True,
+        occlusion_coverage_min: float = 0.05,
+        occlusion_coverage_max: float = 0.65,
+        occlusion_eval_coverage: Optional[float] = None,
+        occlusion_scope: str = "lens",
     ):
         self.root = Path(root)
         self.split = split
@@ -268,6 +273,20 @@ class REVIDESequenceDataset(Dataset):
                 "Use train_mode='dehaze' to measure real video dehazing.\n" + "=" * 88
             )
         self.mask_mode = mask_mode
+        # "occlude": real hazy REVIDE windows with an opaque lens-fixed occluder (src/occlusion.py)
+        # over every frame; the target is the clean frame. Training samples the coverage from
+        # [min, max]; evaluation (occlusion_eval_coverage set) uses a fixed coverage and a shape
+        # derived from the window identity, so every model sees the same occluders.
+        self.occlusion_coverage_min = occlusion_coverage_min
+        self.occlusion_coverage_max = occlusion_coverage_max
+        self.occlusion_eval_coverage = occlusion_eval_coverage
+        # "lens": the occluder covers every frame of the window (dirt on the lens; the scene
+        # behind it is never directly seen). "current": only the current frame is covered (a
+        # transient occluder; earlier frames show the scene). "mixed": each training sample
+        # draws one of the two with equal probability.
+        if occlusion_scope not in ("lens", "current", "mixed"):
+            raise ValueError(f"Unknown occlusion_scope: {occlusion_scope}")
+        self.occlusion_scope = occlusion_scope
 
         # Predictive temporal-consistency training (see src/losses.py) needs the
         # previous frame's own T-length window so a genuine "previous frame
@@ -277,7 +296,7 @@ class REVIDESequenceDataset(Dataset):
         # compute temporal consistency directly from consecutive real
         # predictions (not needed at training time) can pass
         # include_prev_frame=False to skip the extra I/O.
-        self.needs_prev_frame = self.train_mode == "dehaze" and include_prev_frame
+        self.needs_prev_frame = self.train_mode in ("dehaze", "occlude") and include_prev_frame
         self.include_reference_frames = include_reference_frames
         if self.needs_prev_frame and not self.include_reference_frames:
             raise ValueError(
@@ -543,13 +562,37 @@ class REVIDESequenceDataset(Dataset):
             crop,
         )
 
-    def _build_window(self, hazy_frames: torch.Tensor, clean_frames: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _occluder_for(self, height: int, width: int, key: str) -> torch.Tensor:
+        if self.occlusion_eval_coverage is not None:
+            return seeded_occluder_mask(height, width, self.occlusion_eval_coverage, key)
+        coverage = random.uniform(self.occlusion_coverage_min, self.occlusion_coverage_max)
+        return occluder_mask(height, width, coverage)
+
+    def _build_window(
+        self,
+        hazy_frames: torch.Tensor,
+        clean_frames: torch.Tensor,
+        occluder: Optional[torch.Tensor] = None,
+        scope: str = "lens",
+    ) -> Dict[str, torch.Tensor]:
         target = clean_frames[-1]
         _, height, width = target.shape
-        mask = generate_haze_mask(height, width, mode=self._resolve_mask_mode()).float()
+        if self.train_mode == "occlude":
+            if occluder is None:
+                raise ValueError("occlude mode needs an occluder mask")
+            mask = occluder.float()
+        else:
+            mask = generate_haze_mask(height, width, mode=self._resolve_mask_mode()).float()
         if self.train_mode == "dehaze":
             frames = hazy_frames
             corrupted = hazy_frames[-1]
+        elif self.train_mode == "occlude":
+            if scope == "lens":
+                frames = apply_occluder(hazy_frames, mask)
+            else:
+                frames = hazy_frames.clone()
+                frames[-1] = apply_occluder(hazy_frames[-1], mask)
+            corrupted = frames[-1]
         else:
             frames = clean_frames.clone()
             corrupted = simulate_realistic_haze(target.unsqueeze(0), mask.unsqueeze(0))[0]
@@ -579,7 +622,17 @@ class REVIDESequenceDataset(Dataset):
         else:
             hazy_frames, clean_frames, *_ = self._crop_pair(hazy_frames, clean_frames)
 
-        sample = self._build_window(hazy_frames, clean_frames)
+        occluder = None
+        scope = self.occlusion_scope
+        if self.train_mode == "occlude":
+            occluder = self._occluder_for(
+                clean_frames.shape[-2], clean_frames.shape[-1], f"{clip['name']}:{idx}"
+            )
+            if scope == "mixed":
+                scope = random.choice(("lens", "current"))
+        sample = self._build_window(hazy_frames, clean_frames, occluder, scope)
+        if self.train_mode == "occlude":
+            sample["occlusion_scope"] = scope
         sample.update(
             {
                 "clean_frames": clean_frames.float(),
@@ -590,7 +643,11 @@ class REVIDESequenceDataset(Dataset):
             }
         )
         if self.needs_prev_frame:
-            prev_window = self._build_window(prev_hazy, prev_clean)
+            # A lens occluder is in the previous window too; a transient one is not.
+            prev_occluder = occluder
+            if occluder is not None and scope == "current":
+                prev_occluder = torch.zeros_like(occluder)
+            prev_window = self._build_window(prev_hazy, prev_clean, prev_occluder, scope)
             sample["prev_frames"] = prev_window["frames"]
             sample["prev_current_frame"] = prev_window["current_frame"]
             sample["prev_target_frame"] = prev_window["target_frame"]
