@@ -35,6 +35,7 @@ from src.flow import compute_raft_flow, load_raft  # noqa: E402
 from src.losses import LossBundle  # noqa: E402
 from src.metrics import psnr_metric, ssim_metric  # noqa: E402
 from src.occlusion import occluder_key  # noqa: E402
+from src.presets import apply_numerics_preset  # noqa: E402
 from src.validate import infer_diffusion_only_batch  # noqa: E402
 from src.warp import warp_with_flow  # noqa: E402
 
@@ -76,12 +77,15 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--output", required=True)
     ap.add_argument("--save-predictions", default="")
+    ap.add_argument("--preset", default="", help="Numerics preset (the same one every TRDN run uses).")
     args = ap.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     started = time.perf_counter()
 
     config = TRDNConfig(train_mode="occlude", model_variant="diffusion_only", train_unet=False)
     config.override_dataset_root(args.dataset_root)
+    if args.preset:
+        apply_numerics_preset(config, args.preset)
     dataset = REVIDESequenceDataset(
         config.root_for_split("test"), split="test", seq_len=10, crop_size=256, random_crop=False,
         extensions=config.image_extensions, synthetic_if_empty=False, train_mode="occlude",
