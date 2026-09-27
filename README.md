@@ -1,6 +1,6 @@
 # Temporal Reference-Guided Diffusion Network (TRDN) for Video Dehazing
 
-Developed by Amir Moshtaghioun (University of Regina) for the MASc thesis *Temporal modelling for
+Developed by Seyed Amirhossein Moshtaghioun (University of Regina) for the MASc thesis *Temporal modelling for
 real-world video dehazing: A protocol-matched evaluation of recurrent regression and latent
 diffusion*.
 
@@ -512,7 +512,7 @@ If you use this code, please cite the thesis and the REVIDE dataset:
 ```bibtex
 @mastersthesis{moshtaghioun2026temporal,
   title  = {Temporal modelling for real-world video dehazing: A protocol-matched evaluation of recurrent regression and latent diffusion},
-  author = {Moshtaghioun, Amir},
+  author = {Moshtaghioun, Seyed Amirhossein},
   school = {University of Regina},
   year   = {2026}
 }
